@@ -1,7 +1,7 @@
 
 # CLI-INS
 
-**CLI Installer for Android — v0.1**
+**CLI Installer for Android — v1.1**
 
 A lightweight terminal-based Android installer built in C with ncurses for Termux.
 
