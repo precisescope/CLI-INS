@@ -17,6 +17,7 @@ Instagram: **@8bit_binary**
 - Browse Android storage
 - Select APK files using keyboard navigation
 - Install APKs through ADB
+- not needing bullshit default package manager :) 
 
 ## Installation
 
