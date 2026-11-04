@@ -3,7 +3,7 @@
 
 **CLI Installer for Android — v1.1**
 
-A lightweight terminal-based Android installer built in C with ncurses for Termux.
+A lightweight terminal-based Android installer built in C with ncurses for Termux. also includes a precompiled executeable use it (compile if it doesn't) 
 
 Created by **precisescope**.
 
