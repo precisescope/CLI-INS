@@ -31,23 +31,45 @@ What does it do?
 
 Installation
 
-git clone https://github.com/precisescope/CLI-INS.git
-cd CLI-INS
-./cli-ins
-
 Requires Termux, ADB, and the necessary runtime dependencies.
 
-Compiling (if your phone and Termux want to remove 2 minutes from your lifespan)
+1. Install the required packages:
 
 pkg update
 pkg install git clang ncurses android-tools
 
+2. Clone the repository:
+
 git clone https://github.com/precisescope/CLI-INS.git
+
+3. Enter the project directory:
+
 cd CLI-INS
+
+4. Run the precompiled executable:
+
+./cli-ins
+
+Compiling (if your phone and Termux want to remove 2 minutes from your lifespan)
+
+1. Clone the repository:
+
+git clone https://github.com/precisescope/CLI-INS.git
+
+2. Enter the project directory:
+
+cd CLI-INS
+
+3. Compile:
 
 clang -std=c11 -Wall -Wextra -O2 cli-ins.c -o cli-ins -lncurses
 
+4. Make it executable:
+
 chmod +x cli-ins
+
+5. Run it:
+
 ./cli-ins
 
 License
