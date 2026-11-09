@@ -301,7 +301,7 @@ static void header(const char *subtitle)
     erase();
 
     centered(1, APP_NAME, CP_TITLE);
-    centered(2, "ANDROID APK INSTALLATION MANAGER", CP_MUTED);
+    centered(2, "LIGHTWEIGHT CLI APK INSTALLER", CP_MUTED);
 
     if (rows > 4 && cols > 8) {
         color_on(CP_BORDER);
@@ -669,9 +669,6 @@ static int find_active_serial(const char *host,
     pclose(fp);
     return found;
 }
-
-/* Enumerate all active ADB devices, including devices that
-   have not been saved in the CLI-INS phonebook. */
 
 static int get_active_devices(char serials[][SERIAL_SIZE],
                               int max_devices)
@@ -1081,7 +1078,6 @@ static void browse_apks(void)
             items[i + 1] = labels[i];
         }
 
-        /* IMPORTANT: Back is now a separate menu entry. */
         items[count + 1] = "Back";
 
         char title[INPUT_SIZE + 64];
@@ -1213,3 +1209,4 @@ int main(void)
 
     return 0;
 }
+
