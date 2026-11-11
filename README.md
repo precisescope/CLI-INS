@@ -1,8 +1,8 @@
 # CLI-INS
 
-Android APK Installation Manager for Termux
+cli apk installer for Termux
 
-It's just a really, really convenient way to install APKs through ADB without dealing with the extra waiting and friction introduced by Android's installation restrictions.
+It's just a really, really fast af way to install apks via adb without googles bullshit update
 
 Here's some pros and cons of it ;)
 
