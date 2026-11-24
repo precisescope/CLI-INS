@@ -1,29 +1,30 @@
 #define _POSIX_C_SOURCE 200809L
 
-#include <ncurses.h>
-#include <dirent.h>
-#include <locale.h>
 #include <ctype.h>
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <locale.h>
+#include <ncurses.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include <unistd.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
-#include <fcntl.h>
-#include <errno.h>
+#include <unistd.h>
 
 #define APP_NAME "CLI-INS"
-#define APP_VERSION "5.0"
-
-#define MAX_ITEMS 512
+#define APP_VERSION "6.0"
+#define START_DIR "/storage/emulated/0"
 #define MAX_DEVICES 256
+#define MAX_ENTRIES 4096
 #define PATH_SIZE 4096
 #define INPUT_SIZE 256
 #define SERIAL_SIZE 512
-#define CAPTURE_SIZE 1048576
+#define OUTPUT_SIZE 65536
+#define LIST_TOP 8
 
 enum {
     CP_NORMAL = 1,
@@ -41,59 +42,209 @@ typedef struct {
 } Device;
 
 typedef struct {
-    const char *name;
-    const char *package;
-    const char *filename;
-    const char *source;
-    const char *api_url;
-    const char *jq_filter;
-} RecommendedApp;
+    char name[INPUT_SIZE];
+    int is_dir;
+    int is_apk;
+    off_t size;
+} Entry;
+
+typedef struct {
+    char name[32];
+    short fg;
+    short bg;
+    short accent;
+    short sel_fg;
+    short sel_bg;
+    short in_fg;
+    short in_bg;
+} Theme;
 
 static Device devices[MAX_DEVICES];
 static int device_count;
 
+static Entry entries[MAX_ENTRIES];
+static int entry_count;
+static int show_hidden;
+static int show_all_files;
+
+static char home_dir[PATH_SIZE];
 static char config_dir[PATH_SIZE];
 static char phonebook_path[PATH_SIZE];
-static char apk_dir[PATH_SIZE];
+static char theme_path[PATH_SIZE];
 
 static int use_colors;
+static int default_bg_ok;
+static Theme current_theme;
 
 /* ---------------------------------------------------------
-   Recommended applications
+   Themes
    --------------------------------------------------------- */
 
-static const RecommendedApp recommended_apps[] = {
-    {
-        "Termux:X11",
-        "com.termux.x11",
-        "termux-x11-universal-debug.apk",
-        "Termux:X11 official GitHub nightly release",
-        "https://api.github.com/repos/termux/termux-x11/releases/tags/nightly",
-        ".assets[] | select(.name == \"termux-x11-universal-debug.apk\") | .browser_download_url"
-    },
-    {
-        "InstallerX Revived",
-        "com.rosan.installer.x.revived",
-        "installerx-revived.apk",
-        "InstallerX Revived official GitHub releases",
-        "https://api.github.com/repos/wxxsfxyzm/InstallerX-Revived/releases/latest",
-        "[.assets[] | select(.name | endswith(\".apk\"))][0].browser_download_url // empty"
-    },
-    {
-        "F-Droid",
-        "org.fdroid.fdroid",
-        "fdroid.apk",
-        "F-Droid official website",
-        NULL,
-        NULL
-    }
+static const Theme presets[] = {
+    {"Aero",    COLOR_WHITE,  COLOR_BLACK, COLOR_CYAN,    COLOR_BLACK, COLOR_CYAN,    COLOR_WHITE, COLOR_BLUE},
+    {"Matrix",  COLOR_GREEN,  COLOR_BLACK, COLOR_GREEN,   COLOR_BLACK, COLOR_GREEN,   COLOR_BLACK, COLOR_GREEN},
+    {"Amber",   COLOR_YELLOW, COLOR_BLACK, COLOR_YELLOW,  COLOR_BLACK, COLOR_YELLOW,  COLOR_BLACK, COLOR_YELLOW},
+    {"Ocean",   COLOR_WHITE,  COLOR_BLUE,  COLOR_CYAN,    COLOR_BLUE,  COLOR_WHITE,   COLOR_WHITE, COLOR_CYAN},
+    {"Magenta", COLOR_WHITE,  COLOR_BLACK, COLOR_MAGENTA, COLOR_BLACK, COLOR_MAGENTA, COLOR_WHITE, COLOR_MAGENTA},
+    {"Mono",    COLOR_WHITE,  -1,          COLOR_WHITE,   COLOR_BLACK, COLOR_WHITE,   COLOR_BLACK, COLOR_WHITE},
+    {"Paper",   COLOR_BLACK,  COLOR_WHITE, COLOR_BLUE,    COLOR_WHITE, COLOR_BLUE,    COLOR_WHITE, COLOR_BLUE},
 };
 
-#define RECOMMENDED_COUNT \
-    ((int)(sizeof(recommended_apps) / sizeof(recommended_apps[0])))
+#define PRESET_COUNT ((int)(sizeof(presets) / sizeof(presets[0])))
+
+static const char *color_names[] = {
+    "Black", "Red", "Green", "Yellow", "Blue", "Magenta", "Cyan", "White"
+};
+
+static int menu(const char *title, const char *items[], int count);
+
+static short resolve_bg(short c)
+{
+    if (c < 0 && !default_bg_ok)
+        return COLOR_BLACK;
+    return c;
+}
+
+static void apply_theme(const Theme *t)
+{
+    current_theme = *t;
+
+    if (!use_colors)
+        return;
+
+    short bg = resolve_bg(t->bg);
+
+    init_pair(CP_NORMAL, t->fg, bg);
+    init_pair(CP_TITLE, t->fg, bg);
+    init_pair(CP_SELECTED, t->sel_fg, t->sel_bg);
+    init_pair(CP_MUTED, t->accent, bg);
+    init_pair(CP_ACCENT, t->accent, bg);
+    init_pair(CP_BORDER, t->accent, bg);
+    init_pair(CP_INPUT, t->in_fg, t->in_bg);
+
+    bkgd(COLOR_PAIR(CP_NORMAL));
+}
+
+static void save_theme(void)
+{
+    FILE *fp = fopen(theme_path, "w");
+
+    if (!fp)
+        return;
+
+    fprintf(fp, "%s\n%d %d %d %d %d %d %d\n",
+            current_theme.name,
+            current_theme.fg, current_theme.bg, current_theme.accent,
+            current_theme.sel_fg, current_theme.sel_bg,
+            current_theme.in_fg, current_theme.in_bg);
+
+    fclose(fp);
+}
+
+static int valid_color(int c)
+{
+    return c >= -1 && c <= 7;
+}
+
+static void load_theme(void)
+{
+    Theme t = presets[0];
+    char line[256];
+    int v[7];
+    FILE *fp = fopen(theme_path, "r");
+
+    if (fp) {
+        if (fgets(line, sizeof(line), fp)) {
+            line[strcspn(line, "\r\n")] = '\0';
+            snprintf(t.name, sizeof(t.name), "%.31s", line);
+        }
+
+        if (fgets(line, sizeof(line), fp) &&
+            sscanf(line, "%d %d %d %d %d %d %d",
+                   &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6]) == 7 &&
+            valid_color(v[0]) && valid_color(v[1]) && valid_color(v[2]) &&
+            valid_color(v[3]) && valid_color(v[4]) && valid_color(v[5]) &&
+            valid_color(v[6])) {
+            t.fg = (short)v[0];
+            t.bg = (short)v[1];
+            t.accent = (short)v[2];
+            t.sel_fg = (short)v[3];
+            t.sel_bg = (short)v[4];
+            t.in_fg = (short)v[5];
+            t.in_bg = (short)v[6];
+        }
+
+        fclose(fp);
+    }
+
+    apply_theme(&t);
+}
+
+static void custom_theme(void)
+{
+    const char *items[9];
+    int text, bg, accent;
+
+    for (int i = 0; i < 8; i++)
+        items[i] = color_names[i];
+
+    items[8] = "Cancel";
+
+    text = menu("CUSTOM: TEXT COLOR", items, 9);
+    if (text < 0 || text >= 8)
+        return;
+
+    bg = menu("CUSTOM: BACKGROUND", items, 9);
+    if (bg < 0 || bg >= 8)
+        return;
+
+    accent = menu("CUSTOM: ACCENT COLOR", items, 9);
+    if (accent < 0 || accent >= 8)
+        return;
+
+    Theme t = {
+        "Custom",
+        (short)text, (short)bg, (short)accent,
+        COLOR_BLACK, (short)accent,
+        COLOR_WHITE, COLOR_BLUE
+    };
+
+    apply_theme(&t);
+    save_theme();
+}
+
+static void theme_menu(void)
+{
+    const char *items[PRESET_COUNT + 2];
+    char title[64];
+    int n = PRESET_COUNT;
+
+    for (int i = 0; i < n; i++)
+        items[i] = presets[i].name;
+
+    items[n] = "Custom...";
+    items[n + 1] = "Back";
+
+    while (1) {
+        snprintf(title, sizeof(title), "THEME (current: %s)", current_theme.name);
+
+        int sel = menu(title, items, n + 2);
+
+        if (sel < 0 || sel == n + 1)
+            return;
+
+        if (sel == n) {
+            custom_theme();
+        } else {
+            Theme t = presets[sel];
+            apply_theme(&t);
+            save_theme();
+        }
+    }
+}
 
 /* ---------------------------------------------------------
-   Configuration and paths
+   Configuration and validation
    --------------------------------------------------------- */
 
 static int make_directory(const char *path)
@@ -112,49 +263,17 @@ static int make_directory(const char *path)
     return 0;
 }
 
-static int ensure_directory_tree(void)
+static int ensure_config_dir(const char *home)
 {
     char path[PATH_SIZE];
-    const char *home = getenv("HOME");
 
-    if (!home || !*home)
-        return -1;
-
-    if (snprintf(path, sizeof(path), "%s/.config", home)
-        >= (int)sizeof(path))
+    if (snprintf(path, sizeof(path), "%s/.config", home) >= (int)sizeof(path))
         return -1;
 
     if (make_directory(path) != 0)
         return -1;
 
-    if (make_directory(config_dir) != 0)
-        return -1;
-
-    if (snprintf(path, sizeof(path), "%s/.local", home)
-        >= (int)sizeof(path))
-        return -1;
-
-    if (make_directory(path) != 0)
-        return -1;
-
-    if (snprintf(path, sizeof(path), "%s/.local/share", home)
-        >= (int)sizeof(path))
-        return -1;
-
-    if (make_directory(path) != 0)
-        return -1;
-
-    if (snprintf(path, sizeof(path), "%s/.local/share/cli-ins", home)
-        >= (int)sizeof(path))
-        return -1;
-
-    if (make_directory(path) != 0)
-        return -1;
-
-    if (make_directory(apk_dir) != 0)
-        return -1;
-
-    return 0;
+    return make_directory(config_dir);
 }
 
 static int valid_host(const char *host)
@@ -165,8 +284,7 @@ static int valid_host(const char *host)
     for (const char *p = host; *p; p++) {
         unsigned char c = (unsigned char)*p;
 
-        if (!(isalnum(c) || c == '.' || c == ':' ||
-              c == '-' || c == '_'))
+        if (!(isalnum(c) || c == '.' || c == ':' || c == '-' || c == '_'))
             return 0;
     }
 
@@ -185,11 +303,9 @@ static int valid_port(const char *port)
 
     char *end = NULL;
     errno = 0;
-
     long value = strtol(port, &end, 10);
 
-    return errno == 0 && end && !*end &&
-           value >= 1 && value <= 65535;
+    return errno == 0 && end && !*end && value >= 1 && value <= 65535;
 }
 
 static int valid_code(const char *code)
@@ -211,12 +327,19 @@ static int safe_name(const char *name)
         return 0;
 
     for (const char *p = name; *p; p++) {
-        if (*p == '\t' || *p == '\n' ||
-            *p == '\r' || *p == '|')
+        if (*p == '\t' || *p == '\n' || *p == '\r' || *p == '|')
             return 0;
     }
 
     return 1;
+}
+
+static void secure_wipe(void *p, size_t n)
+{
+    volatile unsigned char *v = p;
+
+    while (n--)
+        *v++ = 0;
 }
 
 /* ---------------------------------------------------------
@@ -227,8 +350,7 @@ static int save_phonebook(void)
 {
     char temporary[PATH_SIZE];
 
-    if (snprintf(temporary, sizeof(temporary),
-                 "%s.tmp.XXXXXX", phonebook_path)
+    if (snprintf(temporary, sizeof(temporary), "%s.tmp.XXXXXX", phonebook_path)
         >= (int)sizeof(temporary))
         return -1;
 
@@ -254,9 +376,7 @@ static int save_phonebook(void)
     int failed = 0;
 
     for (int i = 0; i < device_count; i++) {
-        if (fprintf(fp, "%s\t%s\n",
-                    devices[i].name,
-                    devices[i].host) < 0) {
+        if (fprintf(fp, "%s\t%s\n", devices[i].name, devices[i].host) < 0) {
             failed = 1;
             break;
         }
@@ -290,25 +410,17 @@ static void load_phonebook(void)
 
     char line[INPUT_SIZE * 3 + 64];
 
-    while (fgets(line, sizeof(line), fp) &&
-           device_count < MAX_DEVICES) {
+    while (fgets(line, sizeof(line), fp) && device_count < MAX_DEVICES) {
         line[strcspn(line, "\r\n")] = '\0';
 
         char *name = strtok(line, "\t");
         char *host = strtok(NULL, "\t");
 
-        if (!name || !host ||
-            !safe_name(name) || !valid_host(host))
+        if (!name || !host || !safe_name(name) || !valid_host(host))
             continue;
 
-        snprintf(devices[device_count].name,
-                 sizeof(devices[device_count].name),
-                 "%s", name);
-
-        snprintf(devices[device_count].host,
-                 sizeof(devices[device_count].host),
-                 "%s", host);
-
+        snprintf(devices[device_count].name, sizeof(devices[device_count].name), "%s", name);
+        snprintf(devices[device_count].host, sizeof(devices[device_count].host), "%s", host);
         device_count++;
     }
 
@@ -324,8 +436,7 @@ static int save_device(const char *name, const char *host)
         if (!strcmp(devices[i].host, host)) {
             Device old = devices[i];
 
-            snprintf(devices[i].name,
-                     sizeof(devices[i].name), "%s", name);
+            snprintf(devices[i].name, sizeof(devices[i].name), "%s", name);
 
             if (save_phonebook() != 0) {
                 devices[i] = old;
@@ -339,14 +450,8 @@ static int save_device(const char *name, const char *host)
     if (device_count >= MAX_DEVICES)
         return -1;
 
-    snprintf(devices[device_count].name,
-             sizeof(devices[device_count].name),
-             "%s", name);
-
-    snprintf(devices[device_count].host,
-             sizeof(devices[device_count].host),
-             "%s", host);
-
+    snprintf(devices[device_count].name, sizeof(devices[device_count].name), "%s", name);
+    snprintf(devices[device_count].host, sizeof(devices[device_count].host), "%s", host);
     device_count++;
 
     if (save_phonebook() != 0) {
@@ -362,10 +467,14 @@ static int remove_device(int index)
     if (index < 0 || index >= device_count)
         return -1;
 
-    Device backup[MAX_DEVICES];
-    int old_count = device_count;
+    Device *backup = malloc(sizeof(devices));
+
+    if (!backup)
+        return -1;
 
     memcpy(backup, devices, sizeof(devices));
+
+    int old_count = device_count;
 
     for (int i = index; i < device_count - 1; i++)
         devices[i] = devices[i + 1];
@@ -375,35 +484,17 @@ static int remove_device(int index)
     if (save_phonebook() != 0) {
         memcpy(devices, backup, sizeof(devices));
         device_count = old_count;
+        free(backup);
         return -1;
     }
 
+    free(backup);
     return 0;
 }
 
 /* ---------------------------------------------------------
-   Theme and drawing
+   Drawing helpers
    --------------------------------------------------------- */
-
-static void init_theme(void)
-{
-    if (!has_colors())
-        return;
-
-    start_color();
-    use_default_colors();
-
-    init_pair(CP_NORMAL, COLOR_WHITE, COLOR_BLACK);
-    init_pair(CP_TITLE, COLOR_WHITE, COLOR_BLACK);
-    init_pair(CP_SELECTED, COLOR_BLACK, COLOR_CYAN);
-    init_pair(CP_MUTED, COLOR_CYAN, COLOR_BLACK);
-    init_pair(CP_ACCENT, COLOR_CYAN, COLOR_BLACK);
-    init_pair(CP_BORDER, COLOR_CYAN, COLOR_BLACK);
-    init_pair(CP_INPUT, COLOR_WHITE, COLOR_BLUE);
-
-    bkgd(COLOR_PAIR(CP_NORMAL));
-    use_colors = 1;
-}
 
 static void color_on(int pair)
 {
@@ -420,6 +511,7 @@ static void color_off(int pair)
 static void centered(int y, const char *text, int pair)
 {
     int rows, cols;
+
     getmaxyx(stdscr, rows, cols);
     (void)rows;
 
@@ -439,7 +531,6 @@ static void draw_box(int y, int x, int h, int w)
         return;
 
     color_on(CP_BORDER);
-
     mvaddch(y, x, ACS_ULCORNER);
     mvaddch(y, x + w - 1, ACS_URCORNER);
     mvaddch(y + h - 1, x, ACS_LLCORNER);
@@ -461,8 +552,8 @@ static void draw_box(int y, int x, int h, int w)
 static void header(const char *subtitle)
 {
     int rows, cols;
-    getmaxyx(stdscr, rows, cols);
 
+    getmaxyx(stdscr, rows, cols);
     erase();
 
     centered(1, APP_NAME, CP_TITLE);
@@ -478,25 +569,31 @@ static void header(const char *subtitle)
         centered(6, subtitle, CP_ACCENT);
 }
 
-static void footer(void)
+static void footer_lines(const char *first, const char *second)
 {
     int rows, cols;
+
     getmaxyx(stdscr, rows, cols);
+    (void)cols;
 
     if (rows < 6)
         return;
 
-    centered(rows - 4,
-             "ARROWS: Navigate   ENTER: Select   ESC: Back",
-             CP_MUTED);
+    centered(rows - 4, first, CP_MUTED);
+    centered(rows - 3, second, CP_MUTED);
+}
 
-    if (cols >= 60) {
-        centered(rows - 3,
-                 "Made by precisescope (GitHub) | 8bit_binary (Instagram)",
-                 CP_MUTED);
-    } else {
-        centered(rows - 3, "GitHub: precisescope", CP_MUTED);
-    }
+static void footer(void)
+{
+    int rows, cols;
+
+    getmaxyx(stdscr, rows, cols);
+    (void)rows;
+
+    footer_lines("ARROWS: Navigate   ENTER: Select   ESC: Back",
+                 cols >= 60
+                     ? "Made by precisescope (GitHub) | 8bit_binary (Instagram)"
+                     : "GitHub: precisescope");
 }
 
 /* ---------------------------------------------------------
@@ -506,6 +603,7 @@ static void footer(void)
 static void pause_message(const char *message)
 {
     int rows, cols;
+
     getmaxyx(stdscr, rows, cols);
 
     if (rows > 3) {
@@ -524,6 +622,7 @@ static void message_page(const char *title, const char *message)
     header(title);
 
     int rows, cols;
+
     getmaxyx(stdscr, rows, cols);
     (void)cols;
 
@@ -535,12 +634,11 @@ static void message_page(const char *title, const char *message)
     pause_message(" ");
 }
 
-static int read_field(const char *label,
-                      char *buffer, size_t size)
+static int read_field(const char *label, char *buffer, size_t size)
 {
     int rows, cols;
-    getmaxyx(stdscr, rows, cols);
 
+    getmaxyx(stdscr, rows, cols);
     header("INPUT");
 
     if (rows > 8) {
@@ -570,12 +668,11 @@ static int read_field(const char *label,
     return result != ERR;
 }
 
-static int read_secret_field(const char *label,
-                             char *buffer, size_t size)
+static int read_secret_field(const char *label, char *buffer, size_t size)
 {
     int rows, cols;
-    getmaxyx(stdscr, rows, cols);
 
+    getmaxyx(stdscr, rows, cols);
     header("PAIRING CODE");
 
     if (rows > 8) {
@@ -591,6 +688,7 @@ static int read_secret_field(const char *label,
     buffer[0] = '\0';
 
     size_t used = 0;
+
     curs_set(1);
     move(10, 6);
     refresh();
@@ -635,8 +733,7 @@ static int read_secret_field(const char *label,
    Menu
    --------------------------------------------------------- */
 
-static int menu(const char *title,
-                const char *items[], int count)
+static int menu(const char *title, const char *items[], int count)
 {
     int selected = 0;
     int offset = 0;
@@ -646,20 +743,15 @@ static int menu(const char *title,
 
     while (1) {
         int rows, cols;
-        getmaxyx(stdscr, rows, cols);
 
+        getmaxyx(stdscr, rows, cols);
         header(title);
 
         if (rows < 19 || cols < 36) {
-            centered(rows / 2,
-                     "Terminal too small - resize it.",
-                     CP_ACCENT);
+            centered(rows / 2, "Terminal too small - resize it.", CP_ACCENT);
             refresh();
 
             int key = getch();
-
-            if (key == KEY_RESIZE)
-                continue;
 
             if (key == 27)
                 return count - 1;
@@ -674,7 +766,6 @@ static int menu(const char *title,
 
         int panel_x = (cols - panel_width) / 2;
         int panel_y = 8;
-
         int available_height = rows - panel_y - 7;
         int panel_height = count + 3;
 
@@ -695,12 +786,10 @@ static int menu(const char *title,
         if (selected >= offset + visible)
             offset = selected - visible + 1;
 
-        draw_box(panel_y, panel_x,
-                 panel_height, panel_width);
+        draw_box(panel_y, panel_x, panel_height, panel_width);
 
         color_on(CP_MUTED);
-        mvaddnstr(panel_y + 1, panel_x + 3,
-                  "SELECT AN OPTION", panel_width - 6);
+        mvaddnstr(panel_y + 1, panel_x + 3, "SELECT AN OPTION", panel_width - 6);
         color_off(CP_MUTED);
 
         for (int i = 0; i < visible; i++) {
@@ -712,17 +801,14 @@ static int menu(const char *title,
 
             if (index == selected) {
                 color_on(CP_SELECTED);
-                mvhline(y, panel_x + 1, ' ',
-                        panel_width - 2);
+                mvhline(y, panel_x + 1, ' ', panel_width - 2);
                 mvaddnstr(y, panel_x + 3, "> ", 2);
-                mvaddnstr(y, panel_x + 5,
-                          items[index], panel_width - 8);
+                mvaddnstr(y, panel_x + 5, items[index], panel_width - 8);
                 color_off(CP_SELECTED);
             } else {
                 color_on(CP_NORMAL);
                 mvaddnstr(y, panel_x + 3, "  ", 2);
-                mvaddnstr(y, panel_x + 5,
-                          items[index], panel_width - 8);
+                mvaddnstr(y, panel_x + 5, items[index], panel_width - 8);
                 color_off(CP_NORMAL);
             }
         }
@@ -762,7 +848,7 @@ static int menu(const char *title,
 }
 
 /* ---------------------------------------------------------
-   External command execution
+   External commands
    --------------------------------------------------------- */
 
 static int wait_for_child(pid_t pid)
@@ -788,13 +874,10 @@ static int run_command(char *const argv[])
     printf("\n$");
 
     for (int i = 0; argv[i]; i++) {
-        if (i == 3 &&
-            strcmp(argv[0], "adb") == 0 &&
-            strcmp(argv[1], "pair") == 0) {
+        if (i == 3 && strcmp(argv[0], "adb") == 0 && strcmp(argv[1], "pair") == 0)
             printf(" [HIDDEN]");
-        } else {
+        else
             printf(" %s", argv[i]);
-        }
     }
 
     printf("\n\n");
@@ -810,11 +893,10 @@ static int run_command(char *const argv[])
 
     int result = -1;
 
-    if (pid > 0) {
+    if (pid > 0)
         result = wait_for_child(pid);
-    } else {
+    else
         perror("fork");
-    }
 
     if (result >= 0)
         printf("\nCommand exit code: %d\n", result);
@@ -837,8 +919,7 @@ static int run_command(char *const argv[])
     return result;
 }
 
-static int capture_command(char *const argv[],
-                           char *output, size_t output_size)
+static int capture_command(char *const argv[], char *output, size_t output_size)
 {
     if (!output || output_size < 2)
         return -1;
@@ -865,7 +946,6 @@ static int capture_command(char *const argv[],
             _exit(126);
 
         close(pipefd[1]);
-
         execvp(argv[0], argv);
         _exit(127);
     }
@@ -904,103 +984,6 @@ static int capture_command(char *const argv[],
     return wait_for_child(pid);
 }
 
-static int capture_input(char *const argv[],
-                         const char *input,
-                         char *output, size_t output_size)
-{
-    int inpipe[2];
-    int outpipe[2];
-
-    if (pipe(inpipe) != 0)
-        return -1;
-
-    if (pipe(outpipe) != 0) {
-        close(inpipe[0]);
-        close(inpipe[1]);
-        return -1;
-    }
-
-    pid_t pid = fork();
-
-    if (pid < 0) {
-        close(inpipe[0]);
-        close(inpipe[1]);
-        close(outpipe[0]);
-        close(outpipe[1]);
-        return -1;
-    }
-
-    if (pid == 0) {
-        close(inpipe[1]);
-        close(outpipe[0]);
-
-        if (dup2(inpipe[0], STDIN_FILENO) < 0)
-            _exit(126);
-
-        if (dup2(outpipe[1], STDOUT_FILENO) < 0)
-            _exit(126);
-
-        close(inpipe[0]);
-        close(outpipe[1]);
-
-        execvp(argv[0], argv);
-        _exit(127);
-    }
-
-    close(inpipe[0]);
-    close(outpipe[1]);
-
-    size_t input_len = strlen(input);
-    size_t sent = 0;
-
-    while (sent < input_len) {
-        ssize_t n = write(inpipe[1],
-                          input + sent,
-                          input_len - sent);
-
-        if (n < 0) {
-            if (errno == EINTR)
-                continue;
-            break;
-        }
-
-        sent += (size_t)n;
-    }
-
-    close(inpipe[1]);
-
-    size_t used = 0;
-    char buffer[4096];
-
-    while (1) {
-        ssize_t n = read(outpipe[0], buffer, sizeof(buffer));
-
-        if (n < 0) {
-            if (errno == EINTR)
-                continue;
-            break;
-        }
-
-        if (n == 0)
-            break;
-
-        size_t copy = (size_t)n;
-
-        if (copy > output_size - used - 1)
-            copy = output_size - used - 1;
-
-        if (copy > 0) {
-            memcpy(output + used, buffer, copy);
-            used += copy;
-            output[used] = '\0';
-        }
-    }
-
-    close(outpipe[0]);
-
-    return wait_for_child(pid);
-}
-
 static int have_command(const char *command)
 {
     const char *path = getenv("PATH");
@@ -1018,12 +1001,9 @@ static int have_command(const char *command)
 
     while (token) {
         char candidate[PATH_SIZE];
+        int n = snprintf(candidate, sizeof(candidate), "%s/%s", token, command);
 
-        int n = snprintf(candidate, sizeof(candidate),
-                         "%s/%s", token, command);
-
-        if (n >= 0 && (size_t)n < sizeof(candidate) &&
-            access(candidate, X_OK) == 0) {
+        if (n >= 0 && (size_t)n < sizeof(candidate) && access(candidate, X_OK) == 0) {
             free(copy);
             return 1;
         }
@@ -1038,19 +1018,7 @@ static int have_command(const char *command)
 static int check_adb(void)
 {
     if (!have_command("adb")) {
-        message_page("ADB NOT FOUND",
-                     "Install android-tools using pkg first.");
-        return 0;
-    }
-
-    return 1;
-}
-
-static int check_download_tools(void)
-{
-    if (!have_command("curl") || !have_command("jq")) {
-        message_page("DOWNLOAD TOOLS MISSING",
-                     "Install curl and jq using pkg first.");
+        message_page("ADB NOT FOUND", "Install android-tools using pkg first.");
         return 0;
     }
 
@@ -1058,20 +1026,22 @@ static int check_download_tools(void)
 }
 
 /* ---------------------------------------------------------
-   ADB device discovery
+   ADB devices
    --------------------------------------------------------- */
 
-static int get_active_devices(char serials[][SERIAL_SIZE],
-                              int max_devices)
+static int get_active_devices(char serials[][SERIAL_SIZE], int max_devices)
 {
-    char output[65536];
+    char *output = malloc(OUTPUT_SIZE);
 
-    char *args[] = {
-        "adb", "devices", NULL
-    };
-
-    if (capture_command(args, output, sizeof(output)) != 0)
+    if (!output)
         return -1;
+
+    char *args[] = { "adb", "devices", NULL };
+
+    if (capture_command(args, output, OUTPUT_SIZE) != 0) {
+        free(output);
+        return -1;
+    }
 
     int count = 0;
     char *save = NULL;
@@ -1081,41 +1051,38 @@ static int get_active_devices(char serials[][SERIAL_SIZE],
         char listed[SERIAL_SIZE];
         char state[128];
 
-        if (sscanf(line, "%511s %127s", listed, state) == 2 &&
-            strcmp(state, "device") == 0) {
-            snprintf(serials[count],
-                     SERIAL_SIZE, "%s", listed);
+        if (sscanf(line, "%511s %127s", listed, state) == 2 && strcmp(state, "device") == 0) {
+            snprintf(serials[count], SERIAL_SIZE, "%s", listed);
             count++;
         }
 
         line = strtok_r(NULL, "\n", &save);
     }
 
+    free(output);
     return count;
 }
 
-static int find_active_serial(const char *host,
-                              char *serial,
-                              size_t serial_size)
+static int find_active_serial(const char *host, char *serial, size_t serial_size)
 {
-    char serials[MAX_DEVICES][SERIAL_SIZE];
+    char (*serials)[SERIAL_SIZE] = malloc(sizeof(char[SERIAL_SIZE]) * MAX_DEVICES);
 
-    int count = get_active_devices(serials, MAX_DEVICES);
-
-    if (count <= 0)
+    if (!serials)
         return 0;
 
+    int count = get_active_devices(serials, MAX_DEVICES);
+    int found = 0;
     size_t host_len = strlen(host);
 
-    for (int i = 0; i < count; i++) {
-        if (strncmp(serials[i], host, host_len) == 0 &&
-            serials[i][host_len] == ':') {
+    for (int i = 0; i < count && !found; i++) {
+        if (strncmp(serials[i], host, host_len) == 0 && serials[i][host_len] == ':') {
             snprintf(serial, serial_size, "%s", serials[i]);
-            return 1;
+            found = 1;
         }
     }
 
-    return 0;
+    free(serials);
+    return found;
 }
 
 static const char *friendly_name(const char *serial)
@@ -1125,10 +1092,8 @@ static const char *friendly_name(const char *serial)
     for (int i = 0; i < device_count; i++) {
         size_t len = strlen(devices[i].host);
 
-        if (strncmp(serial, devices[i].host, len) == 0 &&
-            serial[len] == ':') {
-            snprintf(result, sizeof(result), "%s",
-                     devices[i].name);
+        if (strncmp(serial, devices[i].host, len) == 0 && serial[len] == ':') {
+            snprintf(result, sizeof(result), "%s", devices[i].name);
             return result;
         }
     }
@@ -1141,78 +1106,53 @@ static int confirm_disconnect(const char *name)
 {
     char prompt[INPUT_SIZE + 64];
 
-    snprintf(prompt, sizeof(prompt),
-             "Disconnect from %.150s?", name);
+    snprintf(prompt, sizeof(prompt), "Disconnect from %.150s?", name);
 
-    const char *items[] = {
-        "No",
-        "Yes, disconnect"
-    };
+    const char *items[] = { "No", "Yes, disconnect" };
 
     return menu(prompt, items, 2) == 1;
 }
-
-/* ---------------------------------------------------------
-   Wireless ADB pairing
-   --------------------------------------------------------- */
 
 static void pair_device(void)
 {
     char name[INPUT_SIZE];
     char host[INPUT_SIZE];
     char port[16];
-    char code[INPUT_SIZE];
+    char code[16];
     char address[INPUT_SIZE + 20];
 
     if (!check_adb())
         return;
 
-    if (!read_field("Friendly device name:",
-                    name, sizeof(name)) ||
-        !read_field("Device IP address:",
-                    host, sizeof(host)) ||
-        !read_field("Pairing port:",
-                    port, sizeof(port)) ||
-        !read_secret_field("Six-digit pairing code:",
-                           code, sizeof(code)))
+    if (!read_field("Friendly device name:", name, sizeof(name)) ||
+        !read_field("Device IP address:", host, sizeof(host)) ||
+        !read_field("Pairing port:", port, sizeof(port)) ||
+        !read_secret_field("Six-digit pairing code:", code, sizeof(code)))
         return;
 
-    if (!safe_name(name) ||
-        !valid_host(host) ||
-        !valid_port(port) ||
-        !valid_code(code)) {
-        message_page("INVALID INPUT",
-                     "Check the name, IP, port and six-digit code.");
+    if (!safe_name(name) || !valid_host(host) || !valid_port(port) || !valid_code(code)) {
+        secure_wipe(code, sizeof(code));
+        message_page("INVALID INPUT", "Check the name, IP, port and six-digit code.");
         return;
     }
 
     snprintf(address, sizeof(address), "%s:%s", host, port);
 
-    char *args[] = {
-        "adb", "pair", address, code, NULL
-    };
+    char *args[] = { "adb", "pair", address, code, NULL };
 
     int result = run_command(args);
 
-    memset(code, 0, sizeof(code));
+    secure_wipe(code, sizeof(code));
 
     if (result == 0) {
-        if (save_device(name, host) == 0) {
-            message_page("DEVICE PAIRED",
-                         "Device name and IP saved successfully.");
-        } else {
-            message_page("SAVE ERROR",
-                         "Pairing succeeded, but saving failed.");
-        }
+        if (save_device(name, host) == 0)
+            message_page("DEVICE PAIRED", "Device name and IP saved successfully.");
+        else
+            message_page("SAVE ERROR", "Pairing succeeded, but saving failed.");
     } else {
-        message_page("PAIRING FAILED",
-                     "Check the pairing code, port and IP.");
+        message_page("PAIRING FAILED", "Check the pairing code, port and IP.");
     }
 }
-
-/* ---------------------------------------------------------
-   Connect / disconnect
-   --------------------------------------------------------- */
 
 static void connect_saved_device(int index)
 {
@@ -1226,19 +1166,13 @@ static void connect_saved_device(int index)
         if (!confirm_disconnect(d.name))
             return;
 
-        char *args[] = {
-            "adb", "disconnect", serial, NULL
-        };
-
+        char *args[] = { "adb", "disconnect", serial, NULL };
         int result = run_command(args);
 
-        if (result == 0) {
-            message_page("DISCONNECTED",
-                         "ADB disconnect command completed.");
-        } else {
-            message_page("DISCONNECT FAILED",
-                         "ADB could not disconnect this device.");
-        }
+        if (result == 0)
+            message_page("DISCONNECTED", "ADB disconnect command completed.");
+        else
+            message_page("DISCONNECT FAILED", "ADB could not disconnect this device.");
 
         return;
     }
@@ -1246,31 +1180,23 @@ static void connect_saved_device(int index)
     char port[16];
     char address[INPUT_SIZE + 20];
 
-    if (!read_field("Wireless debugging connection port:",
-                    port, sizeof(port)))
+    if (!read_field("Wireless debugging connection port:", port, sizeof(port)))
         return;
 
     if (!valid_port(port)) {
-        message_page("INVALID PORT",
-                     "Enter a valid connection port.");
+        message_page("INVALID PORT", "Enter a valid connection port.");
         return;
     }
 
     snprintf(address, sizeof(address), "%s:%s", d.host, port);
 
-    char *args[] = {
-        "adb", "connect", address, NULL
-    };
-
+    char *args[] = { "adb", "connect", address, NULL };
     int result = run_command(args);
 
-    if (result == 0) {
-        message_page("CONNECTION COMMAND SENT",
-                     "The device list will refresh.");
-    } else {
-        message_page("CONNECTION FAILED",
-                     "Check the IP, port and wireless debugging.");
-    }
+    if (result == 0)
+        message_page("CONNECTION COMMAND SENT", "The device list will refresh.");
+    else
+        message_page("CONNECTION FAILED", "Check the IP, port and wireless debugging.");
 }
 
 static void saved_device_list(void)
@@ -1279,8 +1205,7 @@ static void saved_device_list(void)
         load_phonebook();
 
         if (device_count == 0) {
-            message_page("SAVED DEVICES",
-                         "No saved devices. Pair a device first.");
+            message_page("SAVED DEVICES", "No saved devices. Pair a device first.");
             return;
         }
 
@@ -1289,14 +1214,10 @@ static void saved_device_list(void)
         char serial[SERIAL_SIZE];
 
         for (int i = 0; i < device_count; i++) {
-            if (find_active_serial(devices[i].host,
-                                   serial, sizeof(serial))) {
-                snprintf(labels[i], sizeof(labels[i]),
-                         "%s: DISCONNECT", devices[i].name);
-            } else {
-                snprintf(labels[i], sizeof(labels[i]),
-                         "%s: CONNECT", devices[i].name);
-            }
+            if (find_active_serial(devices[i].host, serial, sizeof(serial)))
+                snprintf(labels[i], sizeof(labels[i]), "%s: DISCONNECT", devices[i].name);
+            else
+                snprintf(labels[i], sizeof(labels[i]), "%s: CONNECT", devices[i].name);
 
             items[i] = labels[i];
         }
@@ -1304,8 +1225,7 @@ static void saved_device_list(void)
         items[device_count] = "Remove a saved device";
         items[device_count + 1] = "Back";
 
-        int selected = menu("SAVED DEVICES",
-                            items, device_count + 2);
+        int selected = menu("SAVED DEVICES", items, device_count + 2);
 
         if (selected < 0 || selected == device_count + 1)
             return;
@@ -1318,29 +1238,21 @@ static void saved_device_list(void)
 
             remove_items[device_count] = "Cancel";
 
-            int target = menu("REMOVE SAVED DEVICE",
-                              remove_items, device_count + 1);
+            int target = menu("REMOVE SAVED DEVICE", remove_items, device_count + 1);
 
             if (target >= 0 && target < device_count) {
                 char prompt[INPUT_SIZE + 64];
 
                 snprintf(prompt, sizeof(prompt),
-                         "Remove %.150s from saved devices?",
-                         devices[target].name);
+                         "Remove %.150s from saved devices?", devices[target].name);
 
-                const char *confirm_items[] = {
-                    "No",
-                    "Yes, remove"
-                };
+                const char *confirm_items[] = { "No", "Yes, remove" };
 
                 if (menu(prompt, confirm_items, 2) == 1) {
-                    if (remove_device(target) == 0) {
-                        message_page("DEVICE REMOVED",
-                                     "Saved device entry removed.");
-                    } else {
-                        message_page("SAVE ERROR",
-                                     "Could not update saved devices.");
-                    }
+                    if (remove_device(target) == 0)
+                        message_page("DEVICE REMOVED", "Saved device entry removed.");
+                    else
+                        message_page("SAVE ERROR", "Could not update saved devices.");
                 }
             }
 
@@ -1352,181 +1264,16 @@ static void saved_device_list(void)
 }
 
 /* ---------------------------------------------------------
-   APK utilities
+   APK installation
    --------------------------------------------------------- */
 
-static int is_apk(const char *name)
+static const char *basename_of(const char *path)
 {
-    size_t n = strlen(name);
-
-    return n >= 4 &&
-           strcasecmp(name + n - 4, ".apk") == 0;
+    const char *slash = strrchr(path, '/');
+    return slash ? slash + 1 : path;
 }
 
-static int file_exists(const char *path)
-{
-    struct stat st;
-
-    return stat(path, &st) == 0 && S_ISREG(st.st_mode);
-}
-
-static int download_file(const char *url,
-                         const char *destination)
-{
-    char temporary[PATH_SIZE];
-
-    if (snprintf(temporary, sizeof(temporary),
-                 "%s.part", destination)
-        >= (int)sizeof(temporary))
-        return -1;
-
-    unlink(temporary);
-
-    char *args[] = {
-        "curl",
-        "-fL",
-        "--retry", "2",
-        "--connect-timeout", "20",
-        "-o", temporary,
-        (char *)url,
-        NULL
-    };
-
-    int result = run_command(args);
-
-    if (result != 0) {
-        unlink(temporary);
-        return -1;
-    }
-
-    if (!file_exists(temporary)) {
-        unlink(temporary);
-        return -1;
-    }
-
-    if (rename(temporary, destination) != 0) {
-        unlink(temporary);
-        return -1;
-    }
-
-    return 0;
-}
-
-static int get_github_asset_url(const RecommendedApp *app,
-                                char *url, size_t url_size)
-{
-    char *curl_args[] = {
-        "curl",
-        "-fsSL",
-        "-H", "Accept: application/vnd.github+json",
-        (char *)app->api_url,
-        NULL
-    };
-
-    char *json = malloc(CAPTURE_SIZE);
-
-    if (!json)
-        return -1;
-
-    int result = capture_command(curl_args, json, CAPTURE_SIZE);
-
-    if (result != 0) {
-        free(json);
-        return -1;
-    }
-
-    char *jq_args[] = {
-        "jq",
-        "-r",
-        (char *)app->jq_filter,
-        NULL
-    };
-
-    char output[PATH_SIZE];
-
-    result = capture_input(jq_args, json,
-                           output, sizeof(output));
-
-    free(json);
-
-    if (result != 0)
-        return -1;
-
-    output[strcspn(output, "\r\n")] = '\0';
-
-    if (!*output || strcmp(output, "null") == 0)
-        return -1;
-
-    if (strlen(output) >= url_size)
-        return -1;
-
-    snprintf(url, url_size, "%s", output);
-
-    return 0;
-}
-
-static int get_app_download_url(const RecommendedApp *app,
-                                char *url, size_t url_size)
-{
-    if (strcmp(app->name, "F-Droid") == 0) {
-        snprintf(url, url_size,
-                 "%s", "https://f-droid.org/F-Droid.apk");
-        return 0;
-    }
-
-    return get_github_asset_url(app, url, url_size);
-}
-
-static int download_recommended_app(int index,
-                                    char *apk_path,
-                                    size_t apk_path_size)
-{
-    if (index < 0 || index >= RECOMMENDED_COUNT)
-        return -1;
-
-    const RecommendedApp *app = &recommended_apps[index];
-
-    char url[PATH_SIZE];
-
-    if (get_app_download_url(app, url, sizeof(url)) != 0) {
-        message_page("DOWNLOAD LINK ERROR",
-                     "Could not find the official APK release asset.");
-        return -1;
-    }
-
-    if (snprintf(apk_path, apk_path_size,
-                 "%s/%s", apk_dir, app->filename)
-        >= (int)apk_path_size)
-        return -1;
-
-    char prompt[INPUT_SIZE + 64];
-
-    snprintf(prompt, sizeof(prompt),
-             "Download %s from its official source?", app->name);
-
-    const char *items[] = {
-        "Download APK",
-        "Cancel"
-    };
-
-    if (menu("CONFIRM DOWNLOAD", items, 2) != 0)
-        return -1;
-
-    if (download_file(url, apk_path) != 0) {
-        message_page("DOWNLOAD FAILED",
-                     "Check your connection and try again.");
-        return -1;
-    }
-
-    return 0;
-}
-
-/* ---------------------------------------------------------
-   ADB target selection and APK installation
-   --------------------------------------------------------- */
-
-static int choose_adb_device(char serials[][SERIAL_SIZE],
-                             int count)
+static int choose_adb_device(char serials[][SERIAL_SIZE], int count)
 {
     if (count <= 0)
         return -1;
@@ -1535,18 +1282,14 @@ static int choose_adb_device(char serials[][SERIAL_SIZE],
     const char *items[MAX_DEVICES + 1];
 
     for (int i = 0; i < count; i++) {
-        snprintf(labels[i], sizeof(labels[i]),
-                 "%s | %s",
-                 friendly_name(serials[i]),
-                 serials[i]);
-
+        snprintf(labels[i], sizeof(labels[i]), "%s | %s",
+                 friendly_name(serials[i]), serials[i]);
         items[i] = labels[i];
     }
 
     items[count] = "Cancel";
 
-    int selected = menu("CHOOSE INSTALLATION TARGET",
-                        items, count + 1);
+    int selected = menu("CHOOSE INSTALLATION TARGET", items, count + 1);
 
     if (selected < 0 || selected >= count)
         return -1;
@@ -1554,268 +1297,502 @@ static int choose_adb_device(char serials[][SERIAL_SIZE],
     return selected;
 }
 
-static int package_is_installed(const char *serial,
-                                const char *package)
-{
-    char *args[] = {
-        "adb", "-s", (char *)serial,
-        "shell", "pm", "path", (char *)package,
-        NULL
-    };
-
-    char output[4096];
-
-    int result = capture_command(args, output, sizeof(output));
-
-    return result == 0 && strncmp(output, "package:", 8) == 0;
-}
-
-static void install_apk_on_device(const char *apk_path,
-                                  const char *package,
-                                  const char *app_name)
+static void install_apk(const char *apk_path)
 {
     struct stat st;
+
+    if (stat(apk_path, &st) != 0 || !S_ISREG(st.st_mode)) {
+        message_page("INVALID APK", "The selected file is unavailable.");
+        return;
+    }
 
     if (!check_adb())
         return;
 
-    if (stat(apk_path, &st) != 0 || !S_ISREG(st.st_mode)) {
-        message_page("INVALID APK",
-                     "The selected APK file is unavailable.");
+    char (*serials)[SERIAL_SIZE] = malloc(sizeof(char[SERIAL_SIZE]) * MAX_DEVICES);
+
+    if (!serials) {
+        message_page("MEMORY ERROR", "Could not allocate device list.");
         return;
     }
-
-    char serials[MAX_DEVICES][SERIAL_SIZE];
 
     int count = get_active_devices(serials, MAX_DEVICES);
 
     if (count < 0) {
-        message_page("ADB ERROR",
-                     "Could not read the ADB device list.");
+        free(serials);
+        message_page("ADB ERROR", "Could not read the ADB device list.");
         return;
     }
 
     if (count == 0) {
-        message_page("NO CONNECTED DEVICES",
-                     "Connect an ADB device before installing.");
+        free(serials);
+        message_page("NO CONNECTED DEVICES", "Connect an ADB device before installing.");
         return;
     }
 
     int selected = choose_adb_device(serials, count);
 
-    if (selected < 0)
+    if (selected < 0) {
+        free(serials);
         return;
-
-    int installed = 0;
-
-    if (package && *package)
-        installed = package_is_installed(serials[selected], package);
+    }
 
     char prompt[INPUT_SIZE + 80];
 
-    snprintf(prompt, sizeof(prompt),
-             "%s %s on this device?",
-             installed ? "Update" : "Install", app_name);
+    snprintf(prompt, sizeof(prompt), "Install %.150s?", basename_of(apk_path));
 
-    const char *items[] = {
-        "Continue",
-        "Cancel"
-    };
+    const char *items[] = { "Install", "Cancel" };
 
-    if (menu(prompt, items, 2) != 0)
+    if (menu(prompt, items, 2) != 0) {
+        free(serials);
         return;
+    }
 
     char *args[] = {
-        "adb",
-        "-s", serials[selected],
-        "install", "-r",
-        (char *)apk_path,
-        NULL
+        "adb", "-s", serials[selected], "install", "-r", (char *)apk_path, NULL
     };
 
     int result = run_command(args);
 
-    if (result == 0) {
-        message_page("INSTALLATION FINISHED",
-                     "ADB completed the installation command.");
-    } else {
-        message_page("INSTALLATION FAILED",
-                     "Check ADB output; the existing app was not uninstalled.");
-    }
+    free(serials);
+
+    if (result == 0)
+        message_page("INSTALLATION FINISHED", "ADB completed the installation command.");
+    else
+        message_page("INSTALLATION FAILED", "Check ADB output; the existing app was kept.");
 }
 
-static void recommended_apps_menu(void)
+/* ---------------------------------------------------------
+   File manager
+   --------------------------------------------------------- */
+
+static int is_apk_name(const char *name)
 {
-    while (1) {
-        const char *items[] = {
-            "Termux:X11",
-            "InstallerX Revived",
-            "F-Droid",
-            "Back"
-        };
+    size_t n = strlen(name);
 
-        int selected = menu("RECOMMENDED APPS",
-                            items, 4);
+    return n >= 4 && strcasecmp(name + n - 4, ".apk") == 0;
+}
 
-        if (selected < 0 || selected == 3)
-            return;
+static int compare_entries(const void *a, const void *b)
+{
+    const Entry *x = a;
+    const Entry *y = b;
 
-        if (!check_download_tools())
-            return;
+    if (x->is_dir != y->is_dir)
+        return y->is_dir - x->is_dir;
 
-        if (!check_adb())
-            return;
+    return strcasecmp(x->name, y->name);
+}
 
-        char apk_path[PATH_SIZE];
+static int load_directory(const char *path, int *truncated)
+{
+    DIR *dir = opendir(path);
 
-        if (download_recommended_app(selected,
-                                     apk_path,
-                                     sizeof(apk_path)) != 0)
+    if (!dir)
+        return -1;
+
+    entry_count = 0;
+    *truncated = 0;
+
+    struct dirent *de;
+
+    while ((de = readdir(dir)) != NULL) {
+        const char *name = de->d_name;
+
+        if (!strcmp(name, ".") || !strcmp(name, ".."))
             continue;
 
-        const RecommendedApp *app = &recommended_apps[selected];
+        if (!show_hidden && name[0] == '.')
+            continue;
 
-        install_apk_on_device(apk_path,
-                              app->package,
-                              app->name);
-    }
-}
+        char full[PATH_SIZE];
 
-/* ---------------------------------------------------------
-   General APK installation
-   --------------------------------------------------------- */
+        if (snprintf(full, sizeof(full), "%s/%s", path, name) >= (int)sizeof(full))
+            continue;
 
-static void install_apk(const char *apk_path)
-{
-    install_apk_on_device(apk_path, NULL, "selected APK");
-}
+        struct stat st;
 
-/* ---------------------------------------------------------
-   APK file browser
-   --------------------------------------------------------- */
+        if (stat(full, &st) != 0)
+            continue;
 
-static void browse_apks(void)
-{
-    char path[PATH_SIZE] = "/storage/emulated/0";
+        int is_dir = S_ISDIR(st.st_mode);
+        int is_reg = S_ISREG(st.st_mode);
+        int is_apk = is_reg && is_apk_name(name);
 
-    while (1) {
-        DIR *dir = opendir(path);
+        if (!is_dir && !is_apk && !show_all_files)
+            continue;
 
-        if (!dir) {
-            message_page("CANNOT OPEN DIRECTORY",
-                         "Check Termux storage permission.");
-            return;
+        if (entry_count >= MAX_ENTRIES) {
+            *truncated = 1;
+            break;
         }
 
-        char *names[MAX_ITEMS];
-        int directories[MAX_ITEMS];
-        int count = 0;
-        int truncated = 0;
+        Entry *e = &entries[entry_count++];
 
-        struct dirent *entry;
+        snprintf(e->name, sizeof(e->name), "%s", name);
+        e->is_dir = is_dir;
+        e->is_apk = is_apk;
+        e->size = is_reg ? st.st_size : 0;
+    }
 
-        while ((entry = readdir(dir)) != NULL) {
-            if (!strcmp(entry->d_name, ".") ||
-                !strcmp(entry->d_name, ".."))
-                continue;
+    closedir(dir);
 
-            char full[PATH_SIZE];
+    qsort(entries, (size_t)entry_count, sizeof(Entry), compare_entries);
+    return 0;
+}
 
-            int n = snprintf(full, sizeof(full),
-                             "%s/%s", path, entry->d_name);
+static void format_size(off_t bytes, char *out, size_t size)
+{
+    static const char *units[] = { "B", "KB", "MB", "GB" };
+    double value = (double)bytes;
+    int unit = 0;
 
-            if (n < 0 || (size_t)n >= sizeof(full))
-                continue;
+    while (value >= 1024.0 && unit < 3) {
+        value /= 1024.0;
+        unit++;
+    }
 
-            struct stat st;
+    if (unit == 0)
+        snprintf(out, size, "%ld B", (long)bytes);
+    else
+        snprintf(out, size, "%.1f %s", value, units[unit]);
+}
 
-            if (stat(full, &st) != 0)
-                continue;
+static void parent_path(char *path)
+{
+    if (strcmp(path, "/") == 0)
+        return;
 
-            int is_directory = S_ISDIR(st.st_mode);
+    char *slash = strrchr(path, '/');
 
-            if (!is_directory && !is_apk(entry->d_name))
-                continue;
+    if (!slash || slash == path)
+        strcpy(path, "/");
+    else
+        *slash = '\0';
+}
 
-            if (count >= MAX_ITEMS) {
-                truncated = 1;
+static int join_path(char *dst, size_t size, const char *dir, const char *name)
+{
+    int n = (strcmp(dir, "/") == 0)
+        ? snprintf(dst, size, "/%s", name)
+        : snprintf(dst, size, "%s/%s", dir, name);
+
+    return (n >= 0 && (size_t)n < size) ? 0 : -1;
+}
+
+/* Opens target, replacing path only on success. */
+static int navigate(char *path, size_t size, const char *target,
+                    const char *select_name,
+                    int *selected, int *offset, int *truncated)
+{
+    char tmp[PATH_SIZE];
+
+    snprintf(tmp, sizeof(tmp), "%s", target);
+
+    if (load_directory(tmp, truncated) != 0)
+        return -1;
+
+    snprintf(path, size, "%s", tmp);
+
+    *selected = 0;
+    *offset = 0;
+
+    if (select_name) {
+        for (int i = 0; i < entry_count; i++) {
+            if (!strcmp(entries[i].name, select_name)) {
+                *selected = i;
+                break;
+            }
+        }
+    }
+
+    return 0;
+}
+
+static void open_or_warn(char *path, size_t size, const char *target,
+                         const char *select_name,
+                         int *selected, int *offset, int *truncated)
+{
+    if (navigate(path, size, target, select_name, selected, offset, truncated) != 0)
+        message_page("CANNOT OPEN", "This folder is not readable. Check storage permission.");
+}
+
+static void reload_keep_selection(char *path, size_t size,
+                                  int *selected, int *offset, int *truncated)
+{
+    char keep[INPUT_SIZE] = "";
+
+    if (entry_count > 0)
+        snprintf(keep, sizeof(keep), "%s", entries[*selected].name);
+
+    open_or_warn(path, size, path, keep, selected, offset, truncated);
+}
+
+static int list_height(int rows)
+{
+    int h = rows - LIST_TOP - 6;
+
+    return h < 1 ? 1 : h;
+}
+
+static void draw_browser(const char *path, int selected, int offset, int truncated)
+{
+    int rows, cols;
+
+    getmaxyx(stdscr, rows, cols);
+    header(NULL);
+
+    int width = cols - 4;
+    char shown[PATH_SIZE];
+
+    snprintf(shown, sizeof(shown), "%s", path);
+
+    if (width > 4 && (int)strlen(path) > width)
+        snprintf(shown, sizeof(shown), "...%s", path + strlen(path) - (width - 3));
+
+    color_on(CP_ACCENT);
+    mvaddnstr(6, 2, shown, width);
+    color_off(CP_ACCENT);
+
+    char status[160];
+
+    snprintf(status, sizeof(status),
+             "%d items | hidden: %s | all files: %s%s",
+             entry_count,
+             show_hidden ? "on" : "off",
+             show_all_files ? "on" : "off",
+             truncated ? " | LIST LIMITED" : "");
+
+    color_on(CP_MUTED);
+    mvaddnstr(7, 2, status, width);
+    color_off(CP_MUTED);
+
+    int list_h = list_height(rows);
+
+    if (entry_count == 0) {
+        centered(LIST_TOP + 1, "This folder has no visible items", CP_MUTED);
+    }
+
+    for (int i = 0; i < list_h; i++) {
+        int index = offset + i;
+        int y = LIST_TOP + i;
+
+        if (index >= entry_count)
+            break;
+
+        Entry *e = &entries[index];
+        int is_sel = (index == selected);
+        int pair = is_sel ? CP_SELECTED : CP_NORMAL;
+
+        char size_text[32] = "";
+
+        if (!e->is_dir)
+            format_size(e->size, size_text, sizeof(size_text));
+
+        char label[PATH_SIZE];
+
+        snprintf(label, sizeof(label), "%s%s%s",
+                 e->is_dir ? "[DIR] " : (e->is_apk ? "[APK] " : "      "),
+                 e->name,
+                 e->is_dir ? "/" : "");
+
+        int size_len = (int)strlen(size_text);
+        int name_width = width - size_len - 2;
+
+        if (name_width < 1)
+            name_width = 1;
+
+        color_on(pair);
+        mvhline(y, 2, ' ', width);
+        mvaddnstr(y, 2, label, name_width);
+        color_off(pair);
+
+        if (size_len > 0) {
+            color_on(is_sel ? CP_SELECTED : CP_MUTED);
+            mvaddstr(y, 2 + width - size_len, size_text);
+            color_off(is_sel ? CP_SELECTED : CP_MUTED);
+        }
+    }
+
+    footer_lines("ENTER open/install  BKSP up  g go to path  h home",
+                 ". hidden  a all files  r refresh  q back");
+    refresh();
+}
+
+static void file_manager(void)
+{
+    char path[PATH_SIZE];
+    int selected = 0;
+    int offset = 0;
+    int truncated = 0;
+
+    if (navigate(path, sizeof(path), START_DIR, NULL,
+                 &selected, &offset, &truncated) != 0) {
+        if (navigate(path, sizeof(path), home_dir, NULL,
+                     &selected, &offset, &truncated) != 0)
+            return;
+    }
+
+    while (1) {
+        int rows, cols;
+
+        getmaxyx(stdscr, rows, cols);
+        (void)cols;
+
+        int list_h = list_height(rows);
+        int page = list_h > 1 ? list_h - 1 : 1;
+
+        if (entry_count == 0)
+            selected = 0;
+        else if (selected >= entry_count)
+            selected = entry_count - 1;
+
+        if (selected < offset)
+            offset = selected;
+
+        if (selected >= offset + list_h)
+            offset = selected - list_h + 1;
+
+        if (offset < 0)
+            offset = 0;
+
+        draw_browser(path, selected, offset, truncated);
+
+        int key = getch();
+
+        switch (key) {
+        case KEY_UP:
+            if (selected > 0)
+                selected--;
+            break;
+
+        case KEY_DOWN:
+            if (selected + 1 < entry_count)
+                selected++;
+            break;
+
+        case KEY_PPAGE:
+            selected = (selected - page < 0) ? 0 : selected - page;
+            break;
+
+        case KEY_NPAGE:
+            if (entry_count > 0)
+                selected = (selected + page >= entry_count) ? entry_count - 1 : selected + page;
+            break;
+
+        case KEY_HOME:
+            selected = 0;
+            break;
+
+        case KEY_END:
+            if (entry_count > 0)
+                selected = entry_count - 1;
+            break;
+
+        case '\n':
+        case KEY_ENTER:
+        case KEY_RIGHT: {
+            if (entry_count == 0)
+                break;
+
+            Entry *e = &entries[selected];
+            char target[PATH_SIZE];
+
+            if (join_path(target, sizeof(target), path, e->name) != 0) {
+                message_page("PATH TOO LONG", "This path is too long to open.");
                 break;
             }
 
-            names[count] = strdup(entry->d_name);
-
-            if (!names[count])
-                continue;
-
-            directories[count] = is_directory;
-            count++;
-        }
-
-        closedir(dir);
-
-        char labels[MAX_ITEMS][INPUT_SIZE + 64];
-        const char *items[MAX_ITEMS + 2];
-
-        items[0] = "[ .. ]";
-
-        for (int i = 0; i < count; i++) {
-            snprintf(labels[i], sizeof(labels[i]),
-                     "%s%s%s",
-                     directories[i] ? "[DIR] " : "",
-                     names[i],
-                     directories[i] ? "/" : "");
-
-            items[i + 1] = labels[i];
-        }
-
-        items[count + 1] = "Back";
-
-        char title[INPUT_SIZE + 64];
-
-        snprintf(title, sizeof(title),
-                 "BROWSE: %.180s%s",
-                 path, truncated ? " [LIST LIMITED]" : "");
-
-        int choice = menu(title, items, count + 2);
-
-        if (choice == count + 1) {
-            for (int i = 0; i < count; i++)
-                free(names[i]);
-
-            return;
-        }
-
-        if (choice == 0) {
-            if (strcmp(path, "/") != 0) {
-                char *slash = strrchr(path, '/');
-
-                if (slash == path)
-                    path[1] = '\0';
-                else if (slash)
-                    *slash = '\0';
+            if (e->is_dir) {
+                open_or_warn(path, sizeof(path), target, NULL,
+                         &selected, &offset, &truncated);
+            } else if (e->is_apk) {
+                install_apk(target);
+            } else {
+                message_page("NOT AN APK", "Only .apk files can be installed.");
             }
-        } else if (choice > 0 && choice <= count) {
-            int index = choice - 1;
-            char selected[PATH_SIZE];
+            break;
+        }
 
-            int n = snprintf(selected, sizeof(selected),
-                             "%s/%s", path, names[index]);
+        case KEY_LEFT:
+        case KEY_BACKSPACE:
+        case 127:
+        case 8:
+        case 'u':
+        case 'U': {
+            if (strcmp(path, "/") == 0)
+                break;
 
-            if (n >= 0 && (size_t)n < sizeof(selected)) {
-                if (directories[index]) {
-                    snprintf(path, sizeof(path), "%s", selected);
+            char child[INPUT_SIZE];
+            char parent[PATH_SIZE];
+
+            snprintf(child, sizeof(child), "%s", basename_of(path));
+            snprintf(parent, sizeof(parent), "%s", path);
+            parent_path(parent);
+
+            open_or_warn(path, sizeof(path), parent, child,
+                     &selected, &offset, &truncated);
+            break;
+        }
+
+        case 'h':
+        case 'H':
+            open_or_warn(path, sizeof(path), home_dir, NULL,
+                     &selected, &offset, &truncated);
+            break;
+
+        case 'g':
+        case 'G': {
+            char input[PATH_SIZE];
+
+            if (read_field("Path (e.g. /storage/emulated/0/Download, ~ = home):",
+                           input, sizeof(input)) && input[0]) {
+                char target[PATH_SIZE];
+
+                if (input[0] == '~') {
+                    snprintf(target, sizeof(target), "%s", home_dir);
+                    strncat(target, input + 1, sizeof(target) - strlen(target) - 1);
                 } else {
-                    for (int i = 0; i < count; i++)
-                        free(names[i]);
-
-                    install_apk(selected);
-                    continue;
+                    snprintf(target, sizeof(target), "%s", input);
                 }
+
+                if (target[0] != '/')
+                    message_page("INVALID PATH", "Enter an absolute path.");
+                else
+                    open_or_warn(path, sizeof(path), target, NULL,
+                             &selected, &offset, &truncated);
             }
+            break;
         }
 
-        for (int i = 0; i < count; i++)
-            free(names[i]);
+        case '.':
+            show_hidden = !show_hidden;
+            reload_keep_selection(path, sizeof(path), &selected, &offset, &truncated);
+            break;
+
+        case 'a':
+        case 'A':
+            show_all_files = !show_all_files;
+            reload_keep_selection(path, sizeof(path), &selected, &offset, &truncated);
+            break;
+
+        case 'r':
+        case 'R':
+            reload_keep_selection(path, sizeof(path), &selected, &offset, &truncated);
+            break;
+
+        case 'q':
+        case 'Q':
+        case 27:
+            return;
+
+        case KEY_RESIZE:
+            clear();
+            break;
+
+        default:
+            break;
+        }
     }
 }
 
@@ -1834,34 +1811,26 @@ int main(void)
         return 1;
     }
 
-    if (snprintf(config_dir, sizeof(config_dir),
-                 "%s/.config/cli-ins", home)
-        >= (int)sizeof(config_dir)) {
+    snprintf(home_dir, sizeof(home_dir), "%s", home);
+
+    if (snprintf(config_dir, sizeof(config_dir), "%s/.config/cli-ins", home)
+        >= (int)sizeof(config_dir) ||
+        snprintf(phonebook_path, sizeof(phonebook_path), "%s/devices.tsv", config_dir)
+        >= (int)sizeof(phonebook_path) ||
+        snprintf(theme_path, sizeof(theme_path), "%s/theme.conf", config_dir)
+        >= (int)sizeof(theme_path)) {
         fprintf(stderr, "Configuration path too long.\n");
         return 1;
     }
 
-    if (snprintf(phonebook_path, sizeof(phonebook_path),
-                 "%s/devices.tsv", config_dir)
-        >= (int)sizeof(phonebook_path)) {
-        fprintf(stderr, "Phonebook path too long.\n");
-        return 1;
-    }
-
-    if (snprintf(apk_dir, sizeof(apk_dir),
-                 "%s/.local/share/cli-ins/apks", home)
-        >= (int)sizeof(apk_dir)) {
-        fprintf(stderr, "APK directory path too long.\n");
-        return 1;
-    }
-
-    if (ensure_directory_tree() != 0) {
-        fprintf(stderr,
-                "Could not create CLI-INS configuration directories.\n");
+    if (ensure_config_dir(home) != 0) {
+        fprintf(stderr, "Could not create CLI-INS configuration directory.\n");
         return 1;
     }
 
     load_phonebook();
+
+    setenv("ESCDELAY", "25", 0);
 
     initscr();
     cbreak();
@@ -1869,17 +1838,18 @@ int main(void)
     keypad(stdscr, TRUE);
     curs_set(0);
 
-    if (has_colors())
-        init_theme();
+    if (has_colors() && start_color() == OK) {
+        use_colors = 1;
+        default_bg_ok = (use_default_colors() == OK);
+    }
 
-    mousemask(ALL_MOUSE_EVENTS, NULL);
-    mouseinterval(150);
+    load_theme();
 
     const char *items[] = {
         "Pair a device",
         "Connect to a device",
-        "Browse folders / install APK",
-        "Recommended Apps",
+        "File manager",
+        "Theme",
         "Exit"
     };
 
@@ -1899,11 +1869,11 @@ int main(void)
             break;
 
         case 2:
-            browse_apks();
+            file_manager();
             break;
 
         case 3:
-            recommended_apps_menu();
+            theme_menu();
             break;
 
         default:
@@ -1919,3 +1889,4 @@ int main(void)
 
     return 0;
 }
+
