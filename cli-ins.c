@@ -1,6 +1,8 @@
 #define _POSIX_C_SOURCE 200809L
 
+#include <arpa/inet.h>
 #include <ctype.h>
+#include <netinet/in.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -25,6 +27,7 @@
 #define SERIAL_SIZE 512
 #define OUTPUT_SIZE 65536
 #define LIST_TOP 8
+#define CODE_LEN 6
 
 enum {
     CP_NORMAL = 1,
@@ -45,8 +48,23 @@ typedef struct {
     char name[INPUT_SIZE];
     int is_dir;
     int is_apk;
+    int is_link;
+    int is_broken;
+    int is_special;
     off_t size;
 } Entry;
+
+typedef struct {
+    char serial[SERIAL_SIZE];
+    char state[32];
+} ADBDevice;
+
+static ADBDevice adb_devices[MAX_DEVICES];
+static int adb_device_count;
+static int adb_usable;
+static char adb_problem[300];
+static char adb_output[OUTPUT_SIZE];
+static int phonebook_skipped;
 
 typedef struct {
     char name[32];
@@ -98,7 +116,15 @@ static const char *color_names[] = {
 
 #define MENU_CANCEL (-1)
 
+/* Too small for the forms and file browser to draw without clipping. */
+static int screen_too_small(int rows, int cols)
+{
+    return rows < 14 || cols < 40;
+}
+
 static int menu(const char *title, const char *items[], int count);
+static void message_page(const char *title, const char *message);
+static int join_path(char *dst, size_t size, const char *dir, const char *name);
 
 static short resolve_bg(short c)
 {
@@ -127,20 +153,90 @@ static void apply_theme(const Theme *t)
     bkgd(COLOR_PAIR(CP_NORMAL));
 }
 
-static void save_theme(void)
+
+/* Writes data to a temporary file, flushes it to disk, then renames it over
+   path. Readers see either the old file or the complete new one. */
+static int atomic_write(const char *path, const char *data, size_t length)
 {
-    FILE *fp = fopen(theme_path, "w");
+    char temporary[PATH_SIZE];
+    size_t written = 0;
+    int ok = 1;
+    int fd;
 
-    if (!fp)
-        return;
+    if (snprintf(temporary, sizeof(temporary), "%s.tmp.XXXXXX", path)
+        >= (int)sizeof(temporary))
+        return -1;
 
-    fprintf(fp, "%s\n%d %d %d %d %d %d %d\n",
+    fd = mkstemp(temporary);
+
+    if (fd < 0)
+        return -1;
+
+    if (fchmod(fd, 0600) != 0)
+        ok = 0;
+
+    while (ok && written < length) {
+        ssize_t n = write(fd, data + written, length - written);
+
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            ok = 0;
+        } else {
+            written += (size_t)n;
+        }
+    }
+
+    if (ok && fsync(fd) != 0)
+        ok = 0;
+
+    if (close(fd) != 0)
+        ok = 0;
+
+    if (ok && rename(temporary, path) != 0)
+        ok = 0;
+
+    if (!ok)
+        unlink(temporary);
+
+    return ok ? 0 : -1;
+}
+
+static int save_theme(void)
+{
+    char *buffer = NULL;
+    size_t length = 0;
+    FILE *memory = open_memstream(&buffer, &length);
+    int result;
+
+    if (!memory)
+        return -1;
+
+    fprintf(memory, "%s\n%d %d %d %d %d %d %d\n",
             current_theme.name,
             current_theme.fg, current_theme.bg, current_theme.accent,
             current_theme.sel_fg, current_theme.sel_bg,
             current_theme.in_fg, current_theme.in_bg);
 
-    fclose(fp);
+    if (fclose(memory) != 0) {
+        free(buffer);
+        return -1;
+    }
+
+    result = atomic_write(theme_path, buffer, length);
+    free(buffer);
+    return result;
+}
+
+/* Applies the theme for this session, then saves it. A failed save is
+   reported, but the theme stays active until the app exits. */
+static void apply_and_save_theme(const Theme *t)
+{
+    apply_theme(t);
+
+    if (save_theme() != 0)
+        message_page("THEME NOT SAVED",
+                     "Applied for this session only. Check storage space and permissions.");
 }
 
 static int valid_color(int c)
@@ -182,10 +278,13 @@ static void load_theme(void)
     apply_theme(&t);
 }
 
+
 static void custom_theme(void)
 {
     const char *items[9];
-    int text, bg, accent;
+    int text;
+    int bg;
+    int accent;
 
     for (int i = 0; i < 8; i++)
         items[i] = color_names[i];
@@ -200,6 +299,11 @@ static void custom_theme(void)
     if (bg < 0 || bg >= 8)
         return;
 
+    if (text == bg) {
+        message_page("INVALID THEME", "Text and background cannot be the same color.");
+        return;
+    }
+
     accent = menu("CUSTOM: ACCENT COLOR", items, 9);
     if (accent < 0 || accent >= 8)
         return;
@@ -211,9 +315,9 @@ static void custom_theme(void)
         COLOR_WHITE, COLOR_BLUE
     };
 
-    apply_theme(&t);
-    save_theme();
+    apply_and_save_theme(&t);
 }
+
 
 static void theme_menu(void)
 {
@@ -239,8 +343,7 @@ static void theme_menu(void)
             custom_theme();
         } else {
             Theme t = presets[sel];
-            apply_theme(&t);
-            save_theme();
+            apply_and_save_theme(&t);
         }
     }
 }
@@ -278,19 +381,40 @@ static int ensure_config_dir(const char *home)
     return make_directory(config_dir);
 }
 
+
+/* Removes leading and trailing whitespace in place. */
+static void trim(char *s)
+{
+    size_t len = strlen(s);
+    size_t start = 0;
+
+    while (start < len && isspace((unsigned char)s[start]))
+        start++;
+
+    if (start > 0)
+        memmove(s, s + start, len - start + 1);
+
+    len = strlen(s);
+
+    while (len > 0 && isspace((unsigned char)s[len - 1]))
+        s[--len] = '\0';
+}
+
+/* IPv4 dotted-quad only. Hostnames and IPv6 addresses are rejected on
+   purpose: see the README for the reasoning. */
 static int valid_host(const char *host)
 {
+    struct in_addr addr;
+
     if (!host || !*host || strlen(host) >= INPUT_SIZE)
         return 0;
 
     for (const char *p = host; *p; p++) {
-        unsigned char c = (unsigned char)*p;
-
-        if (!(isalnum(c) || c == '.' || c == ':' || c == '-' || c == '_'))
+        if (!isdigit((unsigned char)*p) && *p != '.')
             return 0;
     }
 
-    return 1;
+    return inet_pton(AF_INET, host, &addr) == 1;
 }
 
 static int valid_port(const char *port)
@@ -310,12 +434,13 @@ static int valid_port(const char *port)
     return errno == 0 && end && !*end && value >= 1 && value <= 65535;
 }
 
+
 static int valid_code(const char *code)
 {
-    if (!code || strlen(code) != 6)
+    if (!code || strlen(code) != CODE_LEN)
         return 0;
 
-    for (int i = 0; i < 6; i++) {
+    for (size_t i = 0; i < CODE_LEN; i++) {
         if (!isdigit((unsigned char)code[i]))
             return 0;
     }
@@ -323,13 +448,24 @@ static int valid_code(const char *code)
     return 1;
 }
 
+
 static int safe_name(const char *name)
 {
-    if (!name || !*name)
+    size_t len;
+
+    if (!name)
+        return 0;
+
+    len = strlen(name);
+
+    if (len == 0 || len >= INPUT_SIZE)
+        return 0;
+
+    if (isspace((unsigned char)name[0]) || isspace((unsigned char)name[len - 1]))
         return 0;
 
     for (const char *p = name; *p; p++) {
-        if (*p == '\t' || *p == '\n' || *p == '\r' || *p == '|')
+        if (*p == '|' || iscntrl((unsigned char)*p))
             return 0;
     }
 
@@ -348,81 +484,95 @@ static void secure_wipe(void *p, size_t n)
    Phonebook
    --------------------------------------------------------- */
 
+
 static int save_phonebook(void)
 {
-    char temporary[PATH_SIZE];
+    char *buffer = NULL;
+    size_t length = 0;
+    FILE *memory = open_memstream(&buffer, &length);
+    int result;
 
-    if (snprintf(temporary, sizeof(temporary), "%s.tmp.XXXXXX", phonebook_path)
-        >= (int)sizeof(temporary))
+    if (!memory)
         return -1;
 
-    int fd = mkstemp(temporary);
+    for (int i = 0; i < device_count; i++)
+        fprintf(memory, "%s\t%s\n", devices[i].name, devices[i].host);
 
-    if (fd < 0)
-        return -1;
-
-    if (fchmod(fd, 0600) != 0) {
-        close(fd);
-        unlink(temporary);
-        return -1;
-    }
-
-    FILE *fp = fdopen(fd, "w");
-
-    if (!fp) {
-        close(fd);
-        unlink(temporary);
+    if (fclose(memory) != 0) {
+        free(buffer);
         return -1;
     }
 
-    int failed = 0;
+    result = atomic_write(phonebook_path, buffer, length);
+    free(buffer);
+    return result;
+}
 
+
+static int host_is_saved(const char *host)
+{
     for (int i = 0; i < device_count; i++) {
-        if (fprintf(fp, "%s\t%s\n", devices[i].name, devices[i].host) < 0) {
-            failed = 1;
-            break;
-        }
-    }
-
-    if (fflush(fp) != 0)
-        failed = 1;
-
-    if (fsync(fd) != 0)
-        failed = 1;
-
-    if (fclose(fp) != 0)
-        failed = 1;
-
-    if (failed || rename(temporary, phonebook_path) != 0) {
-        unlink(temporary);
-        return -1;
+        if (!strcmp(devices[i].host, host))
+            return 1;
     }
 
     return 0;
 }
 
+/* Reads one entry per line: name<TAB>ipv4. Anything else is skipped and
+   counted in phonebook_skipped, so a damaged file never crashes the app. */
 static void load_phonebook(void)
 {
-    device_count = 0;
+    char line[INPUT_SIZE * 2 + 16];
+    FILE *fp;
 
-    FILE *fp = fopen(phonebook_path, "r");
+    device_count = 0;
+    phonebook_skipped = 0;
+
+    fp = fopen(phonebook_path, "r");
 
     if (!fp)
         return;
 
-    char line[INPUT_SIZE * 3 + 64];
+    while (fgets(line, sizeof(line), fp)) {
+        size_t len = strlen(line);
+        char *tab;
 
-    while (fgets(line, sizeof(line), fp) && device_count < MAX_DEVICES) {
-        line[strcspn(line, "\r\n")] = '\0';
+        if (len > 0 && line[len - 1] == '\n') {
+            line[len - 1] = '\0';
+        } else if (!feof(fp)) {
+            int c;
 
-        char *name = strtok(line, "\t");
-        char *host = strtok(NULL, "\t");
+            /* Line longer than the buffer: discard the rest of it. */
+            while ((c = fgetc(fp)) != '\n' && c != EOF)
+                ;
 
-        if (!name || !host || !safe_name(name) || !valid_host(host))
+            phonebook_skipped++;
+            continue;
+        }
+
+        line[strcspn(line, "\r")] = '\0';
+
+        if (line[0] == '\0')
             continue;
 
-        snprintf(devices[device_count].name, sizeof(devices[device_count].name), "%s", name);
-        snprintf(devices[device_count].host, sizeof(devices[device_count].host), "%s", host);
+        tab = strchr(line, '\t');
+
+        if (!tab || strchr(tab + 1, '\t')) {
+            phonebook_skipped++;
+            continue;
+        }
+
+        *tab = '\0';
+
+        if (!safe_name(line) || !valid_host(tab + 1) || host_is_saved(tab + 1)
+            || device_count >= MAX_DEVICES) {
+            phonebook_skipped++;
+            continue;
+        }
+
+        snprintf(devices[device_count].name, sizeof(devices[device_count].name), "%s", line);
+        snprintf(devices[device_count].host, sizeof(devices[device_count].host), "%s", tab + 1);
         device_count++;
     }
 
@@ -636,11 +786,25 @@ static void message_page(const char *title, const char *message)
     pause_message(" ");
 }
 
+
 static int read_field(const char *label, char *buffer, size_t size)
 {
-    int rows, cols;
+    int rows;
+    int cols;
+    int max_len;
+    int result;
 
     getmaxyx(stdscr, rows, cols);
+
+    if (size < 2) {
+        return 0;
+    }
+
+    if (screen_too_small(rows, cols)) {
+        message_page("TERMINAL TOO SMALL", "Resize the terminal to at least 40 x 14.");
+        return 0;
+    }
+
     header("INPUT");
 
     if (rows > 8) {
@@ -649,32 +813,53 @@ static int read_field(const char *label, char *buffer, size_t size)
         color_off(CP_TITLE);
     }
 
-    if (rows > 12) {
-        color_on(CP_INPUT);
-        mvaddstr(10, 4, "> ");
-        color_off(CP_INPUT);
-    }
+    color_on(CP_INPUT);
+    mvaddstr(10, 4, "> ");
+    color_off(CP_INPUT);
 
     buffer[0] = '\0';
+
+    max_len = cols - 8;
+
+    if (max_len > (int)size - 1)
+        max_len = (int)size - 1;
 
     echo();
     curs_set(1);
     move(10, 6);
     clrtoeol();
 
-    int result = getnstr(buffer, (int)size - 1);
+    result = getnstr(buffer, max_len);
 
     noecho();
     curs_set(0);
 
+    buffer[size - 1] = '\0';
+
     return result != ERR;
 }
 
+
+/* Reads exactly CODE_LEN digits. Digits are shown as '*'. Escape wipes the
+   buffer and cancels. */
 static int read_secret_field(const char *label, char *buffer, size_t size)
 {
-    int rows, cols;
+    int rows;
+    int cols;
+    size_t used = 0;
 
     getmaxyx(stdscr, rows, cols);
+
+    if (size < CODE_LEN + 1) {
+        return 0;
+    }
+
+    if (screen_too_small(rows, cols)) {
+        secure_wipe(buffer, size);
+        message_page("TERMINAL TOO SMALL", "Resize the terminal to at least 40 x 14.");
+        return 0;
+    }
+
     header("PAIRING CODE");
 
     if (rows > 8) {
@@ -689,8 +874,6 @@ static int read_secret_field(const char *label, char *buffer, size_t size)
 
     buffer[0] = '\0';
 
-    size_t used = 0;
-
     curs_set(1);
     move(10, 6);
     refresh();
@@ -698,28 +881,34 @@ static int read_secret_field(const char *label, char *buffer, size_t size)
     while (1) {
         int ch = getch();
 
-        if (ch == '\n' || ch == KEY_ENTER)
-            break;
+        if (ch == '\n' || ch == KEY_ENTER) {
+            if (used == CODE_LEN)
+                break;
+            continue;
+        }
 
         if (ch == 27) {
-            buffer[0] = '\0';
+            secure_wipe(buffer, size);
             curs_set(0);
             return 0;
         }
 
         if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
             if (used > 0) {
+                int y;
+                int x;
+
                 used--;
                 buffer[used] = '\0';
-                addch('\b');
-                addch(' ');
-                addch('\b');
+                getyx(stdscr, y, x);
+                mvaddch(y, x - 1, ' ');
+                move(y, x - 1);
                 refresh();
             }
             continue;
         }
 
-        if (ch >= '0' && ch <= '9' && used + 1 < size) {
+        if (ch >= '0' && ch <= '9' && used < CODE_LEN) {
             buffer[used++] = (char)ch;
             buffer[used] = '\0';
             addch('*');
@@ -868,72 +1057,26 @@ static int wait_for_child(pid_t pid)
     return WEXITSTATUS(status);
 }
 
-static int run_command(char *const argv[])
+
+
+
+/* Runs argv with stdin on /dev/null and stdout+stderr captured into output.
+   Returns the exit status, or -1 if the child was killed by a signal. */
+static int capture_command(const char *const argv[], char *output, size_t output_size)
 {
-    fflush(NULL);
-    endwin();
+    int pipefd[2];
+    size_t used = 0;
+    pid_t pid;
 
-    printf("\n$");
-
-    for (int i = 0; argv[i]; i++) {
-        if (i == 3 && strcmp(argv[0], "adb") == 0 && strcmp(argv[1], "pair") == 0)
-            printf(" [HIDDEN]");
-        else
-            printf(" %s", argv[i]);
-    }
-
-    printf("\n\n");
-    fflush(stdout);
-
-    pid_t pid = fork();
-
-    if (pid == 0) {
-        execvp(argv[0], argv);
-        perror("Could not start command");
-        _exit(127);
-    }
-
-    int result = -1;
-
-    if (pid > 0)
-        result = wait_for_child(pid);
-    else
-        perror("fork");
-
-    if (result >= 0)
-        printf("\nCommand exit code: %d\n", result);
-    else
-        printf("\nCommand did not finish normally.\n");
-
-    printf("\nPress Enter to return...");
-    fflush(stdout);
-
-    int ch;
-
-    do {
-        ch = getchar();
-    } while (ch != '\n' && ch != EOF);
-
-    reset_prog_mode();
-    clear();
-    refresh();
-
-    return result;
-}
-
-static int capture_command(char *const argv[], char *output, size_t output_size)
-{
     if (!output || output_size < 2)
         return -1;
 
     output[0] = '\0';
 
-    int pipefd[2];
-
     if (pipe(pipefd) != 0)
         return -1;
 
-    pid_t pid = fork();
+    pid = fork();
 
     if (pid < 0) {
         close(pipefd[0]);
@@ -942,22 +1085,33 @@ static int capture_command(char *const argv[], char *output, size_t output_size)
     }
 
     if (pid == 0) {
+        int devnull = open("/dev/null", O_RDONLY);
+
+        if (devnull >= 0) {
+            dup2(devnull, STDIN_FILENO);
+            close(devnull);
+        }
+
         close(pipefd[0]);
 
-        if (dup2(pipefd[1], STDOUT_FILENO) < 0)
+        if (dup2(pipefd[1], STDOUT_FILENO) < 0 || dup2(pipefd[1], STDERR_FILENO) < 0)
             _exit(126);
 
         close(pipefd[1]);
-        execvp(argv[0], argv);
+
+        /* POSIX declares execvp's argv as char *const[], which predates const
+           string literals. execvp never writes through argv, so the cast is safe. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wcast-qual"
+        execvp(argv[0], (char *const *)argv);
+#pragma GCC diagnostic pop
         _exit(127);
     }
 
     close(pipefd[1]);
 
-    size_t used = 0;
-    char buffer[4096];
-
     while (1) {
+        char buffer[4096];
         ssize_t n = read(pipefd[0], buffer, sizeof(buffer));
 
         if (n < 0) {
@@ -969,14 +1123,12 @@ static int capture_command(char *const argv[], char *output, size_t output_size)
         if (n == 0)
             break;
 
-        size_t copy = (size_t)n;
+        if ((size_t)n > output_size - used - 1)
+            n = (ssize_t)(output_size - used - 1);
 
-        if (copy > output_size - used - 1)
-            copy = output_size - used - 1;
-
-        if (copy > 0) {
-            memcpy(output + used, buffer, copy);
-            used += copy;
+        if (n > 0) {
+            memcpy(output + used, buffer, (size_t)n);
+            used += (size_t)n;
             output[used] = '\0';
         }
     }
@@ -1017,75 +1169,208 @@ static int have_command(const char *command)
     return 0;
 }
 
+
+static int contains_nocase(const char *haystack, const char *needle)
+{
+    size_t n = strlen(needle);
+
+    for (const char *h = haystack; *h; h++) {
+        if (strncasecmp(h, needle, n) == 0)
+            return 1;
+    }
+
+    return 0;
+}
+
+/* adb reports most failures as text, sometimes with exit status 0. */
+static int output_failed(const char *out)
+{
+    return contains_nocase(out, "fail")
+        || contains_nocase(out, "error")
+        || contains_nocase(out, "cannot")
+        || contains_nocase(out, "unable")
+        || contains_nocase(out, "no such");
+}
+
+/* First line of adb output that is not a "* daemon ..." notice. */
+static const char *summary_line(const char *out, char *buf, size_t size)
+{
+    const char *p = out;
+
+    buf[0] = '\0';
+
+    while (*p) {
+        const char *end = strchr(p, '\n');
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+
+        if (len > 0 && p[0] != '*') {
+            size_t n = len < size - 1 ? len : size - 1;
+
+            memcpy(buf, p, n);
+            buf[n] = '\0';
+            return buf;
+        }
+
+        p = end ? end + 1 : p + len;
+    }
+
+    return buf;
+}
+
+static void busy(const char *text)
+{
+    int rows;
+    int cols;
+
+    getmaxyx(stdscr, rows, cols);
+    (void)cols;
+    header("WORKING");
+
+    if (rows > 8)
+        centered(rows / 2, text, CP_ACCENT);
+
+    refresh();
+}
+
+static int adb_run(const char *const argv[], const char *busy_text)
+{
+    busy(busy_text);
+    return capture_command(argv, adb_output, sizeof(adb_output));
+}
+
+static void report_adb_result(const char *ok_title, const char *fail_title,
+                              int rc, const char *success_text)
+{
+    char line[300];
+
+    if (rc == 0 && !output_failed(adb_output)) {
+        message_page(ok_title, success_text);
+        return;
+    }
+
+    summary_line(adb_output, line, sizeof(line));
+
+    if (line[0] == '\0')
+        snprintf(line, sizeof(line), "ADB exited with status %d.", rc);
+
+    message_page(fail_title, line);
+}
+
+/* Checks once that adb is installed and runs. A failed check is retried on
+   the next attempt, so installing adb does not need an app restart. */
+static int adb_ready(void)
+{
+    const char *args[] = { "adb", "version", NULL };
+    int rc;
+
+    if (adb_usable)
+        return 1;
+
+    if (!have_command("adb")) {
+        snprintf(adb_problem, sizeof(adb_problem),
+                 "ADB is not installed. Run: pkg install android-tools");
+        return 0;
+    }
+
+    rc = capture_command(args, adb_output, sizeof(adb_output));
+
+    if (rc == 0 && !output_failed(adb_output)) {
+        adb_usable = 1;
+        return 1;
+    }
+
+    {
+        char line[256];
+
+        summary_line(adb_output, line, sizeof(line));
+        snprintf(adb_problem, sizeof(adb_problem), "ADB did not start (status %d)%s%s",
+                 rc, line[0] ? ": " : "", line);
+    }
+
+    return 0;
+}
+
 static int check_adb(void)
 {
-    if (!have_command("adb")) {
-        message_page("ADB NOT FOUND", "Install android-tools using pkg first.");
+    if (!adb_ready()) {
+        message_page("ADB UNAVAILABLE", adb_problem);
         return 0;
     }
 
     return 1;
 }
 
+/* One "adb devices" call per screen. Everything else reads the cache. */
+static int adb_refresh(void)
+{
+    const char *args[] = { "adb", "devices", NULL };
+    char *copy;
+    char *save = NULL;
+    char *line;
+    int rc;
+
+    rc = capture_command(args, adb_output, sizeof(adb_output));
+    adb_device_count = 0;
+
+    if (rc != 0 || output_failed(adb_output)) {
+        char line_text[256];
+
+        summary_line(adb_output, line_text, sizeof(line_text));
+        snprintf(adb_problem, sizeof(adb_problem), "adb devices failed (status %d)%s%s",
+                 rc, line_text[0] ? ": " : "", line_text);
+        return -1;
+    }
+
+    copy = strdup(adb_output);
+
+    if (!copy) {
+        snprintf(adb_problem, sizeof(adb_problem), "Out of memory.");
+        return -1;
+    }
+
+    for (line = strtok_r(copy, "\n", &save);
+         line && adb_device_count < MAX_DEVICES;
+         line = strtok_r(NULL, "\n", &save)) {
+        char serial[SERIAL_SIZE];
+        char state[32];
+
+        if (line[0] == '*')
+            continue;
+
+        if (sscanf(line, "%511s %31s", serial, state) == 2 && strcmp(serial, "List") != 0) {
+            snprintf(adb_devices[adb_device_count].serial,
+                     sizeof(adb_devices[adb_device_count].serial), "%s", serial);
+            snprintf(adb_devices[adb_device_count].state,
+                     sizeof(adb_devices[adb_device_count].state), "%s", state);
+            adb_device_count++;
+        }
+    }
+
+    free(copy);
+    return 0;
+}
+
+/* Finds a cached device by the host part of its serial. Returns -1 if none. */
+static int find_adb_device(const char *host)
+{
+    size_t len = strlen(host);
+
+    for (int i = 0; i < adb_device_count; i++) {
+        if (strncmp(adb_devices[i].serial, host, len) == 0
+            && adb_devices[i].serial[len] == ':')
+            return i;
+    }
+
+    return -1;
+}
+
 /* ---------------------------------------------------------
    ADB devices
    --------------------------------------------------------- */
 
-static int get_active_devices(char serials[][SERIAL_SIZE], int max_devices)
-{
-    char *output = malloc(OUTPUT_SIZE);
 
-    if (!output)
-        return -1;
 
-    char *args[] = { "adb", "devices", NULL };
 
-    if (capture_command(args, output, OUTPUT_SIZE) != 0) {
-        free(output);
-        return -1;
-    }
-
-    int count = 0;
-    char *save = NULL;
-    char *line = strtok_r(output, "\n", &save);
-
-    while (line && count < max_devices) {
-        char listed[SERIAL_SIZE];
-        char state[128];
-
-        if (sscanf(line, "%511s %127s", listed, state) == 2 && strcmp(state, "device") == 0) {
-            snprintf(serials[count], SERIAL_SIZE, "%s", listed);
-            count++;
-        }
-
-        line = strtok_r(NULL, "\n", &save);
-    }
-
-    free(output);
-    return count;
-}
-
-static int find_active_serial(const char *host, char *serial, size_t serial_size)
-{
-    char (*serials)[SERIAL_SIZE] = malloc(sizeof(char[SERIAL_SIZE]) * MAX_DEVICES);
-
-    if (!serials)
-        return 0;
-
-    int count = get_active_devices(serials, MAX_DEVICES);
-    int found = 0;
-    size_t host_len = strlen(host);
-
-    for (int i = 0; i < count && !found; i++) {
-        if (strncmp(serials[i], host, host_len) == 0 && serials[i][host_len] == ':') {
-            snprintf(serial, serial_size, "%s", serials[i]);
-            found = 1;
-        }
-    }
-
-    free(serials);
-    return found;
-}
 
 static const char *friendly_name(const char *serial)
 {
@@ -1122,111 +1407,160 @@ static int confirm_disconnect(const char *name)
     return confirm_action(prompt, "Yes, disconnect");
 }
 
+
 static void pair_device(void)
 {
     char name[INPUT_SIZE];
     char host[INPUT_SIZE];
     char port[16];
-    char code[16];
-    char address[INPUT_SIZE + 20];
+    char code[CODE_LEN + 4];
+    char address[INPUT_SIZE + 24];
+    const char *args[5];
+    int rc;
+
+    memset(code, 0, sizeof(code));
 
     if (!check_adb())
         return;
 
     if (!read_field("Friendly device name:", name, sizeof(name)) ||
-        !read_field("Device IP address:", host, sizeof(host)) ||
-        !read_field("Pairing port:", port, sizeof(port)) ||
-        !read_secret_field("Six-digit pairing code:", code, sizeof(code)))
+        !read_field("Device IPv4 address (e.g. 192.168.1.20):", host, sizeof(host)) ||
+        !read_field("Pairing port:", port, sizeof(port)))
         return;
+
+    if (!read_secret_field("Six-digit pairing code:", code, sizeof(code))) {
+        secure_wipe(code, sizeof(code));
+        return;
+    }
+
+    trim(name);
+    trim(host);
+    trim(port);
 
     if (!safe_name(name) || !valid_host(host) || !valid_port(port) || !valid_code(code)) {
         secure_wipe(code, sizeof(code));
-        message_page("INVALID INPUT", "Check the name, IP, port and six-digit code.");
+        message_page("INVALID INPUT", "Check the name, IPv4 address, port and six-digit code.");
         return;
     }
 
     snprintf(address, sizeof(address), "%s:%s", host, port);
 
-    char *args[] = { "adb", "pair", address, code, NULL };
+    args[0] = "adb";
+    args[1] = "pair";
+    args[2] = address;
+    args[3] = code;
+    args[4] = NULL;
 
-    int result = run_command(args);
+    rc = adb_run(args, "Pairing...");
 
+    /* The code only needs to live until adb has read it. */
     secure_wipe(code, sizeof(code));
 
-    if (result == 0) {
+    if (rc == 0 && !output_failed(adb_output)) {
         if (save_device(name, host) == 0)
-            message_page("DEVICE PAIRED", "Device name and IP saved successfully.");
+            message_page("DEVICE PAIRED", "Paired and saved.");
         else
-            message_page("SAVE ERROR", "Pairing succeeded, but saving failed.");
-    } else {
-        message_page("PAIRING FAILED", "Check the pairing code, port and IP.");
+            message_page("SAVE ERROR", "Paired, but the phonebook could not be saved.");
+        return;
     }
+
+    report_adb_result("PAIRED", "PAIRING FAILED", rc, "Paired.");
 }
+
 
 static void connect_saved_device(int index)
 {
+    Device d;
+    int found;
+    char port[16];
+    char address[INPUT_SIZE + 24];
+    const char *args[4];
+    int rc;
+
     if (index < 0 || index >= device_count)
         return;
 
-    Device d = devices[index];
-    char serial[SERIAL_SIZE];
+    d = devices[index];
+    found = find_adb_device(d.host);
 
-    if (find_active_serial(d.host, serial, sizeof(serial))) {
+    if (found >= 0) {
         if (!confirm_disconnect(d.name))
             return;
 
-        char *args[] = { "adb", "disconnect", serial, NULL };
-        int result = run_command(args);
+        args[0] = "adb";
+        args[1] = "disconnect";
+        args[2] = adb_devices[found].serial;
+        args[3] = NULL;
 
-        if (result == 0)
-            message_page("DISCONNECTED", "ADB disconnect command completed.");
-        else
-            message_page("DISCONNECT FAILED", "ADB could not disconnect this device.");
-
+        rc = adb_run(args, "Disconnecting...");
+        report_adb_result("DISCONNECTED", "DISCONNECT FAILED", rc, "Device disconnected.");
         return;
     }
-
-    char port[16];
-    char address[INPUT_SIZE + 20];
 
     if (!read_field("Wireless debugging connection port:", port, sizeof(port)))
         return;
 
+    trim(port);
+
     if (!valid_port(port)) {
-        message_page("INVALID PORT", "Enter a valid connection port.");
+        message_page("INVALID PORT", "Enter a port between 1 and 65535.");
         return;
     }
 
     snprintf(address, sizeof(address), "%s:%s", d.host, port);
 
-    char *args[] = { "adb", "connect", address, NULL };
-    int result = run_command(args);
+    args[0] = "adb";
+    args[1] = "connect";
+    args[2] = address;
+    args[3] = NULL;
 
-    if (result == 0)
-        message_page("CONNECTION COMMAND SENT", "The device list will refresh.");
-    else
-        message_page("CONNECTION FAILED", "Check the IP, port and wireless debugging.");
+    rc = adb_run(args, "Connecting...");
+    report_adb_result("CONNECTED", "CONNECTION FAILED", rc,
+                      "Connected. Use the device list to confirm.");
 }
+
 
 static void saved_device_list(void)
 {
+    int first = 1;
+
     while (1) {
+        char labels[MAX_DEVICES][INPUT_SIZE + 96];
+        const char *items[MAX_DEVICES + 2];
+        int selected;
+
         load_phonebook();
+
+        if (first && phonebook_skipped > 0) {
+            char note[160];
+
+            snprintf(note, sizeof(note), "%d invalid saved entr%s ignored.",
+                     phonebook_skipped, phonebook_skipped == 1 ? "y was" : "ies were");
+            message_page("SAVED DEVICES", note);
+        }
+
+        first = 0;
 
         if (device_count == 0) {
             message_page("SAVED DEVICES", "No saved devices. Pair a device first.");
             return;
         }
 
-        char labels[MAX_DEVICES][INPUT_SIZE + 64];
-        const char *items[MAX_DEVICES + 2];
-        char serial[SERIAL_SIZE];
+        if (adb_refresh() != 0) {
+            message_page("ADB ERROR", adb_problem);
+            return;
+        }
 
         for (int i = 0; i < device_count; i++) {
-            if (find_active_serial(devices[i].host, serial, sizeof(serial)))
+            int idx = find_adb_device(devices[i].host);
+
+            if (idx < 0)
+                snprintf(labels[i], sizeof(labels[i]), "%s: CONNECT", devices[i].name);
+            else if (strcmp(adb_devices[idx].state, "device") == 0)
                 snprintf(labels[i], sizeof(labels[i]), "%s: DISCONNECT", devices[i].name);
             else
-                snprintf(labels[i], sizeof(labels[i]), "%s: CONNECT", devices[i].name);
+                snprintf(labels[i], sizeof(labels[i]), "%s: %s - select to disconnect",
+                         devices[i].name, adb_devices[idx].state);
 
             items[i] = labels[i];
         }
@@ -1234,20 +1568,21 @@ static void saved_device_list(void)
         items[device_count] = "Remove a saved device";
         items[device_count + 1] = "Back";
 
-        int selected = menu("SAVED DEVICES", items, device_count + 2);
+        selected = menu("SAVED DEVICES", items, device_count + 2);
 
         if (selected < 0 || selected == device_count + 1)
             return;
 
         if (selected == device_count) {
             const char *remove_items[MAX_DEVICES + 1];
+            int target;
 
             for (int i = 0; i < device_count; i++)
                 remove_items[i] = devices[i].name;
 
             remove_items[device_count] = "Cancel";
 
-            int target = menu("REMOVE SAVED DEVICE", remove_items, device_count + 1);
+            target = menu("REMOVE SAVED DEVICE", remove_items, device_count + 1);
 
             if (target >= 0 && target < device_count) {
                 char prompt[INPUT_SIZE + 64];
@@ -1280,33 +1615,21 @@ static const char *basename_of(const char *path)
     return slash ? slash + 1 : path;
 }
 
-static int choose_adb_device(char serials[][SERIAL_SIZE], int count)
-{
-    if (count <= 0)
-        return -1;
 
-    char labels[MAX_DEVICES][INPUT_SIZE + SERIAL_SIZE + 8];
-    const char *items[MAX_DEVICES + 1];
 
-    for (int i = 0; i < count; i++) {
-        snprintf(labels[i], sizeof(labels[i]), "%s | %s",
-                 friendly_name(serials[i]), serials[i]);
-        items[i] = labels[i];
-    }
-
-    items[count] = "Cancel";
-
-    int selected = menu("CHOOSE INSTALLATION TARGET", items, count + 1);
-
-    if (selected < 0 || selected >= count)
-        return -1;
-
-    return selected;
-}
 
 static void install_apk(const char *apk_path)
 {
     struct stat st;
+    char path_copy[PATH_SIZE];
+    int ready[MAX_DEVICES];
+    int ready_count = 0;
+    char labels[MAX_DEVICES][INPUT_SIZE + SERIAL_SIZE + 8];
+    const char *items[MAX_DEVICES + 1];
+    int choice;
+    char prompt[INPUT_SIZE + 80];
+    const char *args[7];
+    int rc;
 
     if (stat(apk_path, &st) != 0 || !S_ISREG(st.st_mode)) {
         message_page("INVALID APK", "The selected file is unavailable.");
@@ -1316,55 +1639,68 @@ static void install_apk(const char *apk_path)
     if (!check_adb())
         return;
 
-    char (*serials)[SERIAL_SIZE] = malloc(sizeof(char[SERIAL_SIZE]) * MAX_DEVICES);
-
-    if (!serials) {
-        message_page("MEMORY ERROR", "Could not allocate device list.");
+    if (adb_refresh() != 0) {
+        message_page("ADB ERROR", adb_problem);
         return;
     }
 
-    int count = get_active_devices(serials, MAX_DEVICES);
+    for (int i = 0; i < adb_device_count; i++) {
+        if (strcmp(adb_devices[i].state, "device") == 0)
+            ready[ready_count++] = i;
+    }
 
-    if (count < 0) {
-        free(serials);
-        message_page("ADB ERROR", "Could not read the ADB device list.");
+    if (ready_count == 0) {
+        if (adb_device_count == 0) {
+            message_page("NO CONNECTED DEVICES", "Connect an ADB device before installing.");
+        } else {
+            char note[INPUT_SIZE + 160];
+            int first_bad = 0;
+
+            for (int i = 0; i < adb_device_count; i++) {
+                if (strcmp(adb_devices[i].state, "device") != 0) {
+                    first_bad = i;
+                    break;
+                }
+            }
+
+            snprintf(note, sizeof(note),
+                     "%s is %s. Accept the debugging prompt on the phone, or reconnect.",
+                     adb_devices[first_bad].serial, adb_devices[first_bad].state);
+            message_page("DEVICE NOT READY", note);
+        }
         return;
     }
 
-    if (count == 0) {
-        free(serials);
-        message_page("NO CONNECTED DEVICES", "Connect an ADB device before installing.");
-        return;
+    for (int k = 0; k < ready_count; k++) {
+        snprintf(labels[k], sizeof(labels[k]), "%s | %s",
+                 friendly_name(adb_devices[ready[k]].serial),
+                 adb_devices[ready[k]].serial);
+        items[k] = labels[k];
     }
 
-    int selected = choose_adb_device(serials, count);
+    items[ready_count] = "Cancel";
 
-    if (selected < 0) {
-        free(serials);
+    choice = menu("CHOOSE INSTALLATION TARGET", items, ready_count + 1);
+
+    if (choice < 0 || choice >= ready_count)
         return;
-    }
 
-    char prompt[INPUT_SIZE + 80];
-
+    snprintf(path_copy, sizeof(path_copy), "%s", apk_path);
     snprintf(prompt, sizeof(prompt), "Install %.150s?", basename_of(apk_path));
 
-    if (!confirm_action(prompt, "Install")) {
-        free(serials);
+    if (!confirm_action(prompt, "Install"))
         return;
-    }
 
-    char *args[] = {
-        "adb", "-s", serials[selected], "install", "-r", (char *)apk_path, NULL
-    };
+    args[0] = "adb";
+    args[1] = "-s";
+    args[2] = adb_devices[ready[choice]].serial;
+    args[3] = "install";
+    args[4] = "-r";
+    args[5] = path_copy;
+    args[6] = NULL;
 
-    int result = run_command(args);
-
-    free(serials);
-
-    if (result == 0)
-        message_page("INSTALLATION FINISHED", "ADB completed the installation command.");
-    else
-        message_page("INSTALLATION FAILED", "Check ADB output; the existing app was kept.");
+    rc = adb_run(args, "Installing...");
+    report_adb_result("INSTALLED", "INSTALL FAILED", rc, "Installed successfully.");
 }
 
 /* ---------------------------------------------------------
@@ -1389,9 +1725,16 @@ static int compare_entries(const void *a, const void *b)
     return strcasecmp(x->name, y->name);
 }
 
+
+/* Symlinks are followed for navigation, so a link to a folder opens it.
+   The path shown is the path you navigated through (not the resolved one),
+   so ".." goes back the way you came. Broken links appear only in
+   "all files" mode and cannot be opened. Non-regular files (FIFOs, sockets,
+   device nodes) also appear only in "all files" mode. */
 static int load_directory(const char *path, int *truncated)
 {
     DIR *dir = opendir(path);
+    struct dirent *de;
 
     if (!dir)
         return -1;
@@ -1399,10 +1742,16 @@ static int load_directory(const char *path, int *truncated)
     entry_count = 0;
     *truncated = 0;
 
-    struct dirent *de;
-
     while ((de = readdir(dir)) != NULL) {
         const char *name = de->d_name;
+        char full[PATH_SIZE];
+        struct stat lst;
+        struct stat st;
+        int resolved;
+        int is_dir;
+        int is_reg;
+        int is_apk;
+        Entry *e;
 
         if (!strcmp(name, ".") || !strcmp(name, ".."))
             continue;
@@ -1410,19 +1759,19 @@ static int load_directory(const char *path, int *truncated)
         if (!show_hidden && name[0] == '.')
             continue;
 
-        char full[PATH_SIZE];
-
-        if (snprintf(full, sizeof(full), "%s/%s", path, name) >= (int)sizeof(full))
+        if (join_path(full, sizeof(full), path, name) != 0)
             continue;
 
-        struct stat st;
-
-        if (stat(full, &st) != 0)
+        if (lstat(full, &lst) != 0)
             continue;
 
-        int is_dir = S_ISDIR(st.st_mode);
-        int is_reg = S_ISREG(st.st_mode);
-        int is_apk = is_reg && is_apk_name(name);
+        resolved = (stat(full, &st) == 0);
+        is_dir = resolved && S_ISDIR(st.st_mode);
+        is_reg = resolved && S_ISREG(st.st_mode);
+        is_apk = is_reg && is_apk_name(name);
+
+        if (!resolved && !show_all_files)
+            continue;
 
         if (!is_dir && !is_apk && !show_all_files)
             continue;
@@ -1432,11 +1781,14 @@ static int load_directory(const char *path, int *truncated)
             break;
         }
 
-        Entry *e = &entries[entry_count++];
+        e = &entries[entry_count++];
 
         snprintf(e->name, sizeof(e->name), "%s", name);
         e->is_dir = is_dir;
         e->is_apk = is_apk;
+        e->is_link = S_ISLNK(lst.st_mode);
+        e->is_broken = !resolved;
+        e->is_special = resolved && !is_dir && !is_reg;
         e->size = is_reg ? st.st_size : 0;
     }
 
@@ -1540,26 +1892,36 @@ static int list_height(int rows)
     return h < 1 ? 1 : h;
 }
 
+
 static void draw_browser(const char *path, int selected, int offset, int truncated)
 {
-    int rows, cols;
+    int rows;
+    int cols;
+    int width;
+    int list_h;
+    char shown[PATH_SIZE];
+    char status[160];
 
     getmaxyx(stdscr, rows, cols);
     header(NULL);
 
-    int width = cols - 4;
-    char shown[PATH_SIZE];
+    if (screen_too_small(rows, cols)) {
+        centered(rows / 2, "Terminal too small - resize it, or press q.", CP_ACCENT);
+        refresh();
+        return;
+    }
 
-    snprintf(shown, sizeof(shown), "%s", path);
+    width = cols - 4;
 
-    if (width > 4 && (int)strlen(path) > width)
-        snprintf(shown, sizeof(shown), "...%s", path + strlen(path) - (width - 3));
+    /* Keep the tail of long paths: that is where you are. */
+    if ((int)strlen(path) > width)
+        snprintf(shown, sizeof(shown), "...%s", path + strlen(path) - (size_t)(width - 3));
+    else
+        snprintf(shown, sizeof(shown), "%s", path);
 
     color_on(CP_ACCENT);
     mvaddnstr(6, 2, shown, width);
     color_off(CP_ACCENT);
-
-    char status[160];
 
     snprintf(status, sizeof(status),
              "%d items | hidden: %s | all files: %s%s",
@@ -1572,37 +1934,51 @@ static void draw_browser(const char *path, int selected, int offset, int truncat
     mvaddnstr(7, 2, status, width);
     color_off(CP_MUTED);
 
-    int list_h = list_height(rows);
+    list_h = list_height(rows);
 
-    if (entry_count == 0) {
+    if (entry_count == 0)
         centered(LIST_TOP + 1, "This folder has no visible items", CP_MUTED);
-    }
 
     for (int i = 0; i < list_h; i++) {
         int index = offset + i;
         int y = LIST_TOP + i;
+        Entry *e;
+        int is_sel;
+        int pair;
+        char size_text[32] = "";
+        char label[PATH_SIZE];
+        const char *prefix;
+        int size_len;
+        int name_width;
 
         if (index >= entry_count)
             break;
 
-        Entry *e = &entries[index];
-        int is_sel = (index == selected);
-        int pair = is_sel ? CP_SELECTED : CP_NORMAL;
+        e = &entries[index];
+        is_sel = (index == selected);
+        pair = is_sel ? CP_SELECTED : CP_NORMAL;
 
-        char size_text[32] = "";
+        if (e->is_broken)
+            prefix = "[BRK] ";
+        else if (e->is_dir)
+            prefix = "[DIR] ";
+        else if (e->is_apk)
+            prefix = "[APK] ";
+        else if (e->is_special)
+            prefix = "[---] ";
+        else
+            prefix = "      ";
 
-        if (!e->is_dir)
+        if (!e->is_dir && !e->is_broken && !e->is_special)
             format_size(e->size, size_text, sizeof(size_text));
 
-        char label[PATH_SIZE];
+        snprintf(label, sizeof(label), "%s%s%s%s",
+                 prefix, e->name,
+                 e->is_dir ? "/" : "",
+                 e->is_link ? " @" : "");
 
-        snprintf(label, sizeof(label), "%s%s%s",
-                 e->is_dir ? "[DIR] " : (e->is_apk ? "[APK] " : "      "),
-                 e->name,
-                 e->is_dir ? "/" : "");
-
-        int size_len = (int)strlen(size_text);
-        int name_width = width - size_len - 2;
+        size_len = (int)strlen(size_text);
+        name_width = width - size_len - 2;
 
         if (name_width < 1)
             name_width = 1;
@@ -1613,9 +1989,11 @@ static void draw_browser(const char *path, int selected, int offset, int truncat
         color_off(pair);
 
         if (size_len > 0) {
-            color_on(is_sel ? CP_SELECTED : CP_MUTED);
+            int size_pair = is_sel ? CP_SELECTED : CP_MUTED;
+
+            color_on(size_pair);
             mvaddstr(y, 2 + width - size_len, size_text);
-            color_off(is_sel ? CP_SELECTED : CP_MUTED);
+            color_off(size_pair);
         }
     }
 
@@ -1708,11 +2086,15 @@ static void file_manager(void)
                 break;
             }
 
-            if (e->is_dir) {
+            if (e->is_broken) {
+                message_page("BROKEN LINK", "This symbolic link points to nothing.");
+            } else if (e->is_dir) {
                 open_or_warn(path, sizeof(path), target, NULL,
-                         &selected, &offset, &truncated);
+                             &selected, &offset, &truncated);
             } else if (e->is_apk) {
                 install_apk(target);
+            } else if (e->is_special) {
+                message_page("NOT A REGULAR FILE", "Devices, pipes and sockets cannot be opened here.");
             } else {
                 message_page("NOT AN APK", "Only .apk files can be installed.");
             }
