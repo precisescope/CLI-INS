@@ -16,7 +16,7 @@
 #include <unistd.h>
 
 #define APP_NAME "CLI-INS"
-#define APP_VERSION "6.0"
+#define APP_VERSION "6.1"
 #define START_DIR "/storage/emulated/0"
 #define MAX_DEVICES 256
 #define MAX_ENTRIES 4096
@@ -95,6 +95,8 @@ static const Theme presets[] = {
 static const char *color_names[] = {
     "Black", "Red", "Green", "Yellow", "Blue", "Magenta", "Cyan", "White"
 };
+
+#define MENU_CANCEL (-1)
 
 static int menu(const char *title, const char *items[], int count);
 
@@ -753,8 +755,8 @@ static int menu(const char *title, const char *items[], int count)
 
             int key = getch();
 
-            if (key == 27)
-                return count - 1;
+            if (key == 27 || key == 'q' || key == 'Q')
+                return MENU_CANCEL;
 
             continue;
         }
@@ -833,7 +835,7 @@ static int menu(const char *title, const char *items[], int count)
             return selected;
 
         case 27:
-            return count - 1;
+            return MENU_CANCEL;
 
         case KEY_RESIZE:
             clear();
@@ -841,7 +843,7 @@ static int menu(const char *title, const char *items[], int count)
 
         default:
             if (key == 'q' || key == 'Q')
-                return count - 1;
+                return MENU_CANCEL;
             break;
         }
     }
@@ -1102,15 +1104,22 @@ static const char *friendly_name(const char *serial)
     return result;
 }
 
+/* Returns 1 only when the user explicitly picks the yes option.
+   Escape, Q, or the default "No" item never confirm. */
+static int confirm_action(const char *prompt, const char *yes_label)
+{
+    const char *items[] = { "No, cancel", yes_label };
+
+    return menu(prompt, items, 2) == 1;
+}
+
 static int confirm_disconnect(const char *name)
 {
     char prompt[INPUT_SIZE + 64];
 
     snprintf(prompt, sizeof(prompt), "Disconnect from %.150s?", name);
 
-    const char *items[] = { "No", "Yes, disconnect" };
-
-    return menu(prompt, items, 2) == 1;
+    return confirm_action(prompt, "Yes, disconnect");
 }
 
 static void pair_device(void)
@@ -1246,9 +1255,7 @@ static void saved_device_list(void)
                 snprintf(prompt, sizeof(prompt),
                          "Remove %.150s from saved devices?", devices[target].name);
 
-                const char *confirm_items[] = { "No", "Yes, remove" };
-
-                if (menu(prompt, confirm_items, 2) == 1) {
+                if (confirm_action(prompt, "Yes, remove")) {
                     if (remove_device(target) == 0)
                         message_page("DEVICE REMOVED", "Saved device entry removed.");
                     else
@@ -1341,9 +1348,7 @@ static void install_apk(const char *apk_path)
 
     snprintf(prompt, sizeof(prompt), "Install %.150s?", basename_of(apk_path));
 
-    const char *items[] = { "Install", "Cancel" };
-
-    if (menu(prompt, items, 2) != 0) {
+    if (!confirm_action(prompt, "Install")) {
         free(serials);
         return;
     }
@@ -1522,7 +1527,7 @@ static void reload_keep_selection(char *path, size_t size,
 {
     char keep[INPUT_SIZE] = "";
 
-    if (entry_count > 0)
+    if (*selected >= 0 && *selected < entry_count)
         snprintf(keep, sizeof(keep), "%s", entries[*selected].name);
 
     open_or_warn(path, size, path, keep, selected, offset, truncated);
@@ -1692,7 +1697,7 @@ static void file_manager(void)
         case '\n':
         case KEY_ENTER:
         case KEY_RIGHT: {
-            if (entry_count == 0)
+            if (selected < 0 || selected >= entry_count)
                 break;
 
             Entry *e = &entries[selected];
@@ -1876,6 +1881,7 @@ int main(void)
             theme_menu();
             break;
 
+        case MENU_CANCEL:
         default:
             running = 0;
             break;

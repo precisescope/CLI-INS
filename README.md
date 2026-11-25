@@ -65,8 +65,6 @@ chmod +x cli-ins
 ./cli-ins
 ```
 
-> The repository's old precompiled `cli-ins` binary predates version 6.0. Build from source as shown above.
-
 ## Configuration
 
 CLI-INS stores its files in `~/.config/cli-ins/`:
