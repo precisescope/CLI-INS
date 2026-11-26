@@ -1,4 +1,4 @@
-#CLI-INS
+# CLI-INS
 
 cli based apk installer for android :p
 It's just a really, really convenient way to install APKs through ADB without dealing with Google's extra bullshit and unnecessary waiting.
@@ -41,14 +41,14 @@ Installation
 Install the dependencies:
 ```
 pkg update
-```
 pkg install git clang ncurses android-tools
-```
 Give Termux storage access:
+```
 ```
 termux-setup-storage
 ```
 Clone the repository:
+
 ```
 git clone https://github.com/precisescope/CLI-INS.git
 cd CLI-INS
