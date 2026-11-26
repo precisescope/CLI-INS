@@ -1,7 +1,7 @@
 # CLI-INS
 
 cli based apk installer for android :p
-It's just a really, really convenient way to install APKs through ADB without dealing with Google's extra bullshit and unnecessary waiting.
+It's just a really, really convenient way to install APKs through ADB without dealing with package manager crashing unexpectedly
 
 Here's some pros and cons of it ;)
 
