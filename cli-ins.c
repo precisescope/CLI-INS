@@ -18,7 +18,7 @@
 #include <unistd.h>
 
 #define APP_NAME "CLI-INS"
-#define APP_VERSION "6.1"
+#define APP_VERSION "6.1.1"
 #define START_DIR "/storage/emulated/0"
 #define MAX_DEVICES 256
 #define MAX_ENTRIES 4096
@@ -102,10 +102,8 @@ static const Theme presets[] = {
     {"Aero",    COLOR_WHITE,  COLOR_BLACK, COLOR_CYAN,    COLOR_BLACK, COLOR_CYAN,    COLOR_WHITE, COLOR_BLUE},
     {"Matrix",  COLOR_GREEN,  COLOR_BLACK, COLOR_GREEN,   COLOR_BLACK, COLOR_GREEN,   COLOR_BLACK, COLOR_GREEN},
     {"Amber",   COLOR_YELLOW, COLOR_BLACK, COLOR_YELLOW,  COLOR_BLACK, COLOR_YELLOW,  COLOR_BLACK, COLOR_YELLOW},
-    {"Ocean",   COLOR_WHITE,  COLOR_BLUE,  COLOR_CYAN,    COLOR_BLUE,  COLOR_WHITE,   COLOR_WHITE, COLOR_CYAN},
     {"Magenta", COLOR_WHITE,  COLOR_BLACK, COLOR_MAGENTA, COLOR_BLACK, COLOR_MAGENTA, COLOR_WHITE, COLOR_MAGENTA},
     {"Mono",    COLOR_WHITE,  -1,          COLOR_WHITE,   COLOR_BLACK, COLOR_WHITE,   COLOR_BLACK, COLOR_WHITE},
-    {"Paper",   COLOR_BLACK,  COLOR_WHITE, COLOR_BLUE,    COLOR_WHITE, COLOR_BLUE,    COLOR_WHITE, COLOR_BLUE},
 };
 
 #define PRESET_COUNT ((int)(sizeof(presets) / sizeof(presets[0])))
@@ -117,9 +115,10 @@ static const char *color_names[] = {
 #define MENU_CANCEL (-1)
 
 /* Too small for the forms and file browser to draw without clipping. */
+
 static int screen_too_small(int rows, int cols)
 {
-    return rows < 14 || cols < 40;
+    return rows < 20 || cols < 40;
 }
 
 static int menu(const char *title, const char *items[], int count);
@@ -787,102 +786,62 @@ static void message_page(const char *title, const char *message)
 }
 
 
-static int read_field(const char *label, char *buffer, size_t size)
+
+/* Shared text entry. Enter accepts once min_len characters are typed,
+   Backspace deletes, and Escape cancels: it returns 0 and clears the buffer.
+   Secret entry shows '*' per character and accepts digits only. */
+static int read_input(const char *title, const char *label, char *buffer,
+                      size_t size, int secret, size_t min_len, size_t max_len)
 {
-    int rows;
-    int cols;
-    int max_len;
-    int result;
-
-    getmaxyx(stdscr, rows, cols);
-
-    if (size < 2) {
-        return 0;
-    }
-
-    if (screen_too_small(rows, cols)) {
-        message_page("TERMINAL TOO SMALL", "Resize the terminal to at least 40 x 14.");
-        return 0;
-    }
-
-    header("INPUT");
-
-    if (rows > 8) {
-        color_on(CP_TITLE);
-        mvaddnstr(8, 4, label, cols - 8);
-        color_off(CP_TITLE);
-    }
-
-    color_on(CP_INPUT);
-    mvaddstr(10, 4, "> ");
-    color_off(CP_INPUT);
-
-    buffer[0] = '\0';
-
-    max_len = cols - 8;
-
-    if (max_len > (int)size - 1)
-        max_len = (int)size - 1;
-
-    echo();
-    curs_set(1);
-    move(10, 6);
-    clrtoeol();
-
-    result = getnstr(buffer, max_len);
-
-    noecho();
-    curs_set(0);
-
-    buffer[size - 1] = '\0';
-
-    return result != ERR;
-}
-
-
-/* Reads exactly CODE_LEN digits. Digits are shown as '*'. Escape wipes the
-   buffer and cancels. */
-static int read_secret_field(const char *label, char *buffer, size_t size)
-{
-    int rows;
-    int cols;
     size_t used = 0;
 
-    getmaxyx(stdscr, rows, cols);
-
-    if (size < CODE_LEN + 1) {
-        return 0;
-    }
-
-    if (screen_too_small(rows, cols)) {
-        secure_wipe(buffer, size);
-        message_page("TERMINAL TOO SMALL", "Resize the terminal to at least 40 x 14.");
-        return 0;
-    }
-
-    header("PAIRING CODE");
-
-    if (rows > 8) {
-        color_on(CP_TITLE);
-        mvaddnstr(8, 4, label, cols - 8);
-        color_off(CP_TITLE);
-    }
-
-    color_on(CP_INPUT);
-    mvaddstr(10, 4, "> ");
-    color_off(CP_INPUT);
-
     buffer[0] = '\0';
 
+    if (size < 2)
+        return 0;
+
+    if (max_len > size - 1)
+        max_len = size - 1;
+
     curs_set(1);
-    move(10, 6);
-    refresh();
 
     while (1) {
-        int ch = getch();
+        int rows;
+        int cols;
+        int field_width;
+        int ch;
+
+        getmaxyx(stdscr, rows, cols);
+        field_width = cols - 8;
+
+        header(title);
+
+        if (rows > 8 && field_width > 0) {
+            color_on(CP_TITLE);
+            mvaddnstr(8, 4, label, field_width);
+            color_off(CP_TITLE);
+        }
+
+        if (rows > 10 && field_width > 0) {
+            color_on(CP_INPUT);
+            mvaddstr(10, 4, "> ");
+            color_off(CP_INPUT);
+
+            if (secret) {
+                for (size_t i = 0; i < used && (int)i < field_width; i++)
+                    mvaddch(10, 6 + (int)i, '*');
+            } else {
+                mvaddnstr(10, 6, buffer, field_width);
+            }
+
+            move(10, 6 + (int)(used < (size_t)field_width ? used : (size_t)field_width));
+        }
+
+        refresh();
+        ch = getch();
 
         if (ch == '\n' || ch == KEY_ENTER) {
-            if (used == CODE_LEN)
+            if (used >= min_len)
                 break;
             continue;
         }
@@ -895,29 +854,60 @@ static int read_secret_field(const char *label, char *buffer, size_t size)
 
         if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
             if (used > 0) {
-                int y;
-                int x;
-
                 used--;
                 buffer[used] = '\0';
-                getyx(stdscr, y, x);
-                mvaddch(y, x - 1, ' ');
-                move(y, x - 1);
-                refresh();
             }
             continue;
         }
 
-        if (ch >= '0' && ch <= '9' && used < CODE_LEN) {
-            buffer[used++] = (char)ch;
-            buffer[used] = '\0';
-            addch('*');
-            refresh();
+        if (secret ? (ch >= '0' && ch <= '9') : (ch >= 32 && ch < 127)) {
+            if (used < max_len) {
+                buffer[used++] = (char)ch;
+                buffer[used] = '\0';
+            }
         }
     }
 
     curs_set(0);
     return 1;
+}
+
+static int read_field(const char *label, char *buffer, size_t size)
+{
+    int rows;
+    int cols;
+
+    getmaxyx(stdscr, rows, cols);
+
+    if (screen_too_small(rows, cols)) {
+        buffer[0] = '\0';
+        message_page("TERMINAL TOO SMALL", "Resize the terminal to at least 40 x 20.");
+        return 0;
+    }
+
+    /* Leave room on the right so the typed text never wraps. */
+    return read_input("INPUT", label, buffer, size, 0, 0, (size_t)(cols - 9));
+}
+
+
+/* Reads exactly CODE_LEN digits. Digits are shown as '*'. Escape wipes the
+   buffer and cancels. */
+
+/* Exactly CODE_LEN digits, shown as '*'. Escape cancels and wipes the buffer. */
+static int read_secret_field(const char *label, char *buffer, size_t size)
+{
+    int rows;
+    int cols;
+
+    getmaxyx(stdscr, rows, cols);
+
+    if (screen_too_small(rows, cols)) {
+        secure_wipe(buffer, size);
+        message_page("TERMINAL TOO SMALL", "Resize the terminal to at least 40 x 20.");
+        return 0;
+    }
+
+    return read_input("PAIRING CODE", label, buffer, size, 1, CODE_LEN, CODE_LEN);
 }
 
 /* ---------------------------------------------------------
@@ -938,7 +928,7 @@ static int menu(const char *title, const char *items[], int count)
         getmaxyx(stdscr, rows, cols);
         header(title);
 
-        if (rows < 19 || cols < 36) {
+        if (screen_too_small(rows, cols)) {
             centered(rows / 2, "Terminal too small - resize it.", CP_ACCENT);
             refresh();
 
@@ -957,7 +947,7 @@ static int menu(const char *title, const char *items[], int count)
 
         int panel_x = (cols - panel_width) / 2;
         int panel_y = 8;
-        int available_height = rows - panel_y - 7;
+        int available_height = rows - panel_y - 6;
         int panel_height = count + 3;
 
         if (panel_height > available_height)
@@ -1997,7 +1987,7 @@ static void draw_browser(const char *path, int selected, int offset, int truncat
         }
     }
 
-    footer_lines("ENTER open/install  BKSP up  g go to path  h home",
+    footer_lines("ENTER open/install  BKSP up  g go to path  h storage",
                  ". hidden  a all files  r refresh  q back");
     refresh();
 }
@@ -2124,8 +2114,11 @@ static void file_manager(void)
 
         case 'h':
         case 'H':
-            open_or_warn(path, sizeof(path), home_dir, NULL,
-                     &selected, &offset, &truncated);
+            /* Shared storage, or the Termux home if storage is not readable. */
+            if (navigate(path, sizeof(path), START_DIR, NULL,
+                         &selected, &offset, &truncated) != 0)
+                open_or_warn(path, sizeof(path), home_dir, NULL,
+                             &selected, &offset, &truncated);
             break;
 
         case 'g':
@@ -2187,6 +2180,227 @@ static void file_manager(void)
    Main
    --------------------------------------------------------- */
 
+/* ---------------------------------------------------------
+   Update: reinstall from the official repository
+   --------------------------------------------------------- */
+
+#define REPO_URL "https://github.com/precisescope/CLI-INS"
+#define REPO_CLONE_URL "https://github.com/precisescope/CLI-INS.git"
+
+/* Tests can point the clone at a local repository with CLI_INS_REPO_URL.
+   Do not set it in normal use: whatever it points at gets compiled and
+   installed in place of this program. */
+static const char *repo_clone_url(void)
+{
+    const char *override = getenv("CLI_INS_REPO_URL");
+
+    return (override && *override) ? override : REPO_CLONE_URL;
+}
+
+static int copy_file(const char *from, const char *to, mode_t mode)
+{
+    FILE *in = fopen(from, "rb");
+    FILE *out;
+    char buffer[8192];
+    size_t n;
+    int ok = 1;
+
+    if (!in)
+        return -1;
+
+    out = fopen(to, "wb");
+
+    if (!out) {
+        fclose(in);
+        return -1;
+    }
+
+    while ((n = fread(buffer, 1, sizeof(buffer), in)) > 0) {
+        if (fwrite(buffer, 1, n, out) != n) {
+            ok = 0;
+            break;
+        }
+    }
+
+    if (ferror(in))
+        ok = 0;
+
+    if (fflush(out) != 0 || fsync(fileno(out)) != 0)
+        ok = 0;
+
+    if (fchmod(fileno(out), mode) != 0)
+        ok = 0;
+
+    if (fclose(out) != 0)
+        ok = 0;
+
+    fclose(in);
+    return ok ? 0 : -1;
+}
+
+/* Puts new_path in place of the program this process was started from. The
+   copy is written beside the old one and renamed over it, so the old program
+   is only removed once the new one is complete. The theme file and saved
+   devices live elsewhere and are not touched. */
+static int replace_running_program(const char *new_path)
+{
+    char exe[PATH_SIZE];
+    char staging[PATH_SIZE];
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+
+    if (n <= 0)
+        return -1;
+
+    exe[n] = '\0';
+
+    if (snprintf(staging, sizeof(staging), "%s.new", exe) >= (int)sizeof(staging))
+        return -1;
+
+    if (copy_file(new_path, staging, 0755) != 0) {
+        unlink(staging);
+        return -1;
+    }
+
+    if (rename(staging, exe) != 0) {
+        unlink(staging);
+        return -1;
+    }
+
+    return 0;
+}
+
+static void open_repository(void)
+{
+    message_page("OFFICIAL REPOSITORY", REPO_URL);
+}
+
+/* Clones the official repository, builds it, and only then replaces the
+   running program. A failure at any step leaves the current program in
+   place. The cloned source is deleted when the update finishes. */
+static void reinstall_from_repo(void)
+{
+    char root[PATH_SIZE];
+    char cache[PATH_SIZE];
+    char staging[PATH_SIZE];
+    char source[PATH_SIZE];
+    char built[PATH_SIZE];
+    char message[PATH_SIZE + 160];
+    const char *compiler = NULL;
+    const char *rm_args[4];
+    const char *clone_args[11];
+    const char *cc_args[11];
+    struct stat st;
+    int rc;
+
+    if (!have_command("git")) {
+        message_page("GIT NOT FOUND", "Updating needs git. Run: pkg install git");
+        return;
+    }
+
+    if (have_command("clang"))
+        compiler = "clang";
+    else if (have_command("gcc"))
+        compiler = "gcc";
+
+    if (!compiler) {
+        message_page("NO COMPILER", "Updating needs clang. Run: pkg install clang");
+        return;
+    }
+
+    if (!confirm_action("Reinstall CLI-INS from the official repository? "
+                        "Your theme and saved devices are kept.",
+                        "Yes, reinstall"))
+        return;
+
+    if (snprintf(cache, sizeof(cache), "%s/.cache", home_dir) >= (int)sizeof(cache)
+        || snprintf(root, sizeof(root), "%s/.cache/cli-ins", home_dir) >= (int)sizeof(root)
+        || snprintf(staging, sizeof(staging), "%s/.cache/cli-ins/update", home_dir) >= (int)sizeof(staging)
+        || snprintf(source, sizeof(source), "%s/cli-ins.c", staging) >= (int)sizeof(source)
+        || snprintf(built, sizeof(built), "%s/cli-ins-new", staging) >= (int)sizeof(built)) {
+        message_page("PATH TOO LONG", "The update folder path is too long.");
+        return;
+    }
+
+    if (make_directory(cache) != 0 || make_directory(root) != 0) {
+        message_page("UPDATE FAILED", "Could not create ~/.cache/cli-ins.");
+        return;
+    }
+
+    rm_args[0] = "rm";
+    rm_args[1] = "-rf";
+    rm_args[2] = staging;
+    rm_args[3] = NULL;
+    busy("Preparing...");
+    capture_command(rm_args, adb_output, sizeof(adb_output));
+
+    /* Stall detection instead of a fixed timeout: git gives up if the
+       transfer drops below 1 KB/s for 30 seconds. */
+    clone_args[0] = "git";
+    clone_args[1] = "-c";
+    clone_args[2] = "http.lowSpeedLimit=1000";
+    clone_args[3] = "-c";
+    clone_args[4] = "http.lowSpeedTime=30";
+    clone_args[5] = "clone";
+    clone_args[6] = "--depth";
+    clone_args[7] = "1";
+    clone_args[8] = repo_clone_url();
+    clone_args[9] = staging;
+    clone_args[10] = NULL;
+
+    busy("Cloning the repository...");
+    rc = capture_command(clone_args, adb_output, sizeof(adb_output));
+
+    if (rc != 0 || stat(source, &st) != 0 || !S_ISREG(st.st_mode)) {
+        char line[260];
+
+        summary_line(adb_output, line, sizeof(line));
+        snprintf(message, sizeof(message), "Clone failed%s%s", line[0] ? ": " : ".", line);
+        message_page("UPDATE FAILED", message);
+        rm_args[2] = staging;
+        capture_command(rm_args, adb_output, sizeof(adb_output));
+        return;
+    }
+
+    cc_args[0] = compiler;
+    cc_args[1] = "-std=c11";
+    cc_args[2] = "-Wall";
+    cc_args[3] = "-Wextra";
+    cc_args[4] = "-O2";
+    cc_args[5] = source;
+    cc_args[6] = "-o";
+    cc_args[7] = built;
+    cc_args[8] = "-lncurses";
+    cc_args[9] = NULL;
+
+    busy("Building...");
+    rc = capture_command(cc_args, adb_output, sizeof(adb_output));
+
+    if (rc != 0) {
+        char line[260];
+
+        summary_line(adb_output, line, sizeof(line));
+        snprintf(message, sizeof(message), "Build failed%s%s", line[0] ? ": " : ".", line);
+        message_page("UPDATE FAILED", message);
+        rm_args[2] = staging;
+        capture_command(rm_args, adb_output, sizeof(adb_output));
+        return;
+    }
+
+    busy("Installing...");
+
+    if (replace_running_program(built) != 0) {
+        snprintf(message, sizeof(message),
+                 "Could not replace this copy. The new build is at %s", built);
+        message_page("REPLACE FAILED", message);
+        return;
+    }
+
+    rm_args[2] = staging;
+    capture_command(rm_args, adb_output, sizeof(adb_output));
+
+    message_page("UPDATED", "Reinstalled from the official repository. Reopen CLI-INS to use it.");
+}
+
 int main(void)
 {
     setlocale(LC_ALL, "");
@@ -2237,13 +2451,15 @@ int main(void)
         "Connect to a device",
         "File manager",
         "Theme",
+        "Update CLI-INS",
+        "Official repository",
         "Exit"
     };
 
     int running = 1;
 
     while (running) {
-        int choice = menu("MAIN MENU", items, 5);
+        int choice = menu("MAIN MENU", items, 7);
 
         switch (choice) {
         case 0:
@@ -2261,6 +2477,14 @@ int main(void)
 
         case 3:
             theme_menu();
+            break;
+
+        case 4:
+            reinstall_from_repo();
+            break;
+
+        case 5:
+            open_repository();
             break;
 
         case MENU_CANCEL:
